@@ -30,6 +30,7 @@ export async function account() {
     email, password, options: { data: { display_name: 'Test diner' } },
   }));
   assert.ok(session, 'The disposable test project must have email confirmation disabled.');
+  await client.realtime.setAuth();
   return { client, user, token: session.access_token, email, password };
 }
 
@@ -39,6 +40,7 @@ export async function asExistingUser(identity) {
     access_token: identity.session.access_token,
     refresh_token: identity.session.refresh_token,
   }));
+  await client.realtime.setAuth();
   return client;
 }
 
@@ -66,14 +68,19 @@ export async function startApi(clientDist) {
   };
 }
 
-export async function subscribed(channel, timeout = 12_000) {
+export async function subscribed(channel, timeout = 20_000) {
   await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('Realtime subscription timed out.')), timeout);
-    channel.subscribe((status, error) => {
-      if (status === 'SUBSCRIBED') {
+    let lastMessage = 'Waiting for the Postgres Changes listener.';
+    const timer = setTimeout(() => reject(new Error('Realtime subscription timed out. ' + lastMessage)), timeout);
+    channel.on('system', '*', ({ extension, status, message }) => {
+      if (extension !== 'postgres_changes') return;
+      lastMessage = message;
+      if (status === 'ok') {
         clearTimeout(timer);
         resolve();
-      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+      }
+    }).subscribe((status, error) => {
+      if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
         clearTimeout(timer);
         reject(error ?? new Error('Realtime subscription ' + status));
       }

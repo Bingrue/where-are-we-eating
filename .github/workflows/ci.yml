@@ -34,7 +34,7 @@ jobs:
       - run: npm run build
       - run: npm run test:integration
       - run: npx --no-install playwright install --with-deps chromium
-      - run: node --test tests/browser.test.js
+      - run: npm run test:browser
       - name: Realtime and polling smoke benchmarks
         shell: bash
         run: |
@@ -44,5 +44,10 @@ jobs:
         shell: bash
         run: |
           psql "$BENCH_DATABASE_URL" -v group_count=8 -v polls_per_group=10 -v voter_count=25 -f benchmarks/query-plans.sql
+      - if: failure()
+        name: Realtime service diagnostics
+        run: |
+          docker ps -a --filter name=supabase_realtime --format '{{.Names}}' |
+            xargs -r -n 1 docker logs --tail 60
       - if: always()
         run: npm run db -- stop --no-backup

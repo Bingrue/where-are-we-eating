@@ -40,14 +40,27 @@ function usePollSnapshot(pollId) {
         clearTimeout(timer);
         timer = setTimeout(load, 80);
       })
-      .subscribe((status) => {
-        if (!active) return;
-        connected = status === 'SUBSCRIBED';
+      .on('system', '*', ({ extension, status }) => {
+        if (!active || extension !== 'postgres_changes') return;
+        connected = status === 'ok';
         setLive(connected);
         if (connected) void load();
       });
+    supabase.realtime.setAuth().then(() => {
+      if (!active) return;
+      channel.subscribe((status) => {
+        if (active && status !== 'SUBSCRIBED') {
+          connected = false;
+          setLive(false);
+        }
+      });
+    }).catch(() => { /* Snapshot polling continues while the channel is unavailable. */ });
+    let lastRecovery = Date.now();
     const fallback = setInterval(() => {
-      if (!connected && document.visibilityState === 'visible') void load();
+      if (document.visibilityState === 'visible' && (!connected || Date.now() - lastRecovery >= 30_000)) {
+        lastRecovery = Date.now();
+        void load();
+      }
     }, 5_000);
     function onVisible() {
       if (document.visibilityState === 'visible') void load();

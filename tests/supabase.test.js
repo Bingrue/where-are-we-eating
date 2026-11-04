@@ -107,7 +107,7 @@ test('the close snapshot includes every concurrent vote that succeeded and rejec
   }
 });
 
-test('Realtime reaches members only, and a fresh snapshot recovers missed updates', { timeout: 35_000 }, async () => {
+test('Realtime reaches members only, and a fresh snapshot recovers missed updates', { timeout: 55_000 }, async () => {
   const { poll, first, second } = await setupPoll(owner, group);
   let received;
   let outsiderEvents = 0;
