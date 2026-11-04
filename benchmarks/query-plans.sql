@@ -29,15 +29,15 @@ select g.id, u.id, case when u.n = 1 then 'owner' else 'member' end
 from bench_groups g cross join bench_users u;
 
 create temporary table bench_polls as
-select g.id as group_id, g.n as group_n, n, gen_random_uuid() as id
-from bench_groups g cross join generate_series(1, :polls_per_group) n;
+select g.id as group_id, g.n as group_n, poll_number.n, gen_random_uuid() as id
+from bench_groups g cross join generate_series(1, :polls_per_group) as poll_number(n);
 insert into public.polls (id, group_id, question, created_by, created_at)
 select p.id, p.group_id, 'Dinner poll ' || p.n, u.id, now() - make_interval(mins => p.n)
 from bench_polls p cross join bench_users u where u.n = 1;
 
 create temporary table bench_options as
-select p.id as poll_id, p.group_n, p.n as poll_n, n, gen_random_uuid() as id
-from bench_polls p cross join generate_series(1, 4) n;
+select p.id as poll_id, p.group_n, restaurant_number.n, gen_random_uuid() as id
+from bench_polls p cross join generate_series(1, 4) as restaurant_number(n);
 insert into public.options (id, poll_id, name, category, price_level, created_by)
 select o.id, o.poll_id, 'Restaurant ' || o.n, 'Bistro', o.n, u.id
 from bench_options o cross join bench_users u where u.n = 1;
