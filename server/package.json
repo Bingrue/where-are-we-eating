@@ -1,0 +1,16 @@
+{
+  "name": "@eating/server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --env-file-if-exists=.env index.js",
+    "start": "node --env-file-if-exists=.env index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.89.0",
+    "express": "^5.2.0",
+    "express-rate-limit": "^8.2.0",
+    "helmet": "^8.1.0",
+    "zod": "^4.2.0"
+  }
+}

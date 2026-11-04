@@ -1,0 +1,30 @@
+{
+  "name": "where-are-we-eating",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev": "concurrently --kill-others-on-fail --names api,web \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "npm run dev --workspace server",
+    "dev:web": "npm run dev --workspace client",
+    "build": "npm run build --workspace client",
+    "start": "npm run start --workspace server",
+    "test": "node --test tests/api.test.js",
+    "test:integration": "node --env-file-if-exists=.env.test --test tests/supabase.test.js",
+    "benchmark:realtime": "node --env-file-if-exists=.env.test benchmarks/realtime.js",
+    "db": "supabase",
+    "test:browser": "node --env-file-if-exists=.env.test --test tests/browser.test.js"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.0",
+    "playwright": "^1.64.1",
+    "supabase": "^2.54.0"
+  }
+}
