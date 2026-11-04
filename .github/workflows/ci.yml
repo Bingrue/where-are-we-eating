@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
@@ -33,8 +33,9 @@ jobs:
           } >> "$GITHUB_ENV"
       - run: npm run build
       - run: npm run test:integration
-      - run: npx --no-install playwright install --with-deps chromium
       - run: npm run test:browser
+        env:
+          TEST_BROWSER_CHANNEL: chrome
       - name: Realtime and polling smoke benchmarks
         shell: bash
         run: |

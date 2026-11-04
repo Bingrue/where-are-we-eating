@@ -9,7 +9,7 @@ import { account, startApi } from './support.js';
 test('two browser sessions can join, suggest, vote live and view a saved result', { timeout: 75_000 }, async (t) => {
   const api = await startApi(fileURLToPath(new URL('../client/dist/', import.meta.url)));
   t.after(() => api.close());
-  const browser = await chromium.launch();
+  const browser = await chromium.launch({ channel: process.env.TEST_BROWSER_CHANNEL });
   t.after(() => browser.close());
   const host = await browser.newPage();
   const guest = await browser.newPage({ viewport: { width: 390, height: 844 } });
