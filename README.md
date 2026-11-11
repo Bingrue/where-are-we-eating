@@ -1,21 +1,21 @@
-# Where Are We Eating
+# Where Are We Eating?
 
-项目起步版。React 和 Express 通过 `GET /api/health` 验证连通，Supabase 的本地配置和环境变量模板可用于接下来的开发。
+A starter project for a group restaurant polling app. It includes a React frontend, an Express API, and configuration for running Supabase locally.
 
-## 启动 React 和 Express
+## Run the frontend and API
 
-使用 Node.js 24，在本目录执行：
+Use Node.js 24 and run these commands from the repository root:
 
 ```bash
 npm ci
 npm run dev
 ```
 
-打开 http://localhost:5173，页面应显示 `API connected`。也可以打开 http://localhost:3000/api/health，预期返回 `{"status":"ok"}`。健康检查只验证 Express。
+Open [http://localhost:5173](http://localhost:5173). The page should display **API connected**. You can also open [the health endpoint](http://localhost:3000/api/health) directly and check that it returns `{"status":"ok"}`. The health check verifies that Express is running.
 
-## 启动本地 Supabase
+## Start local Supabase
 
-启动 Docker，再执行：
+Start Docker, then run:
 
 ```bash
 npm run db -- start
@@ -24,6 +24,6 @@ cp client/.env.example client/.env
 cp server/.env.example server/.env
 ```
 
-按 `db status` 的输出填写 API URL 和 publishable key。Supabase Studio 在 http://127.0.0.1:54323。完成后可以用 `npm run db -- stop` 停止服务。
+Copy the local API URL and publishable key from the status output into both environment files. Open [Supabase Studio](http://127.0.0.1:54323) to inspect the local database. Run `npm run db -- stop` when you're done.
 
-Supabase 配置和 SDK 依赖已就绪。接下来可以实现登录，并按 proposal 添加数据库迁移和投票流程。
+The next steps are to connect the app to Supabase Auth, add the database schema, and build the polling flow.
