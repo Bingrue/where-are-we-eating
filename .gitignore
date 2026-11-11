@@ -3,9 +3,7 @@ dist/
 .env
 .env.*
 !.env.example
-!.env.test.example
 .supabase/
 supabase/.temp/
 supabase/.branches/
-coverage/
 *.log

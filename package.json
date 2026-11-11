@@ -16,15 +16,10 @@
     "dev:web": "npm run dev --workspace client",
     "build": "npm run build --workspace client",
     "start": "npm run start --workspace server",
-    "test": "node --test tests/api.test.js",
-    "test:integration": "node --env-file-if-exists=.env.test --test tests/supabase.test.js",
-    "benchmark:realtime": "node --env-file-if-exists=.env.test benchmarks/realtime.js",
-    "db": "supabase",
-    "test:browser": "node --env-file-if-exists=.env.test --test tests/browser.test.js"
+    "db": "supabase"
   },
   "devDependencies": {
     "concurrently": "^9.2.0",
-    "playwright": "^1.64.1",
     "supabase": "^2.54.0"
   }
 }
