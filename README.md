@@ -33,7 +33,7 @@ The schema lives in `supabase/migrations/`:
 | `20261114000000_core_schema.sql` | The six tables, keys, one-vote-per-user rule, “option belongs to this poll” rule and the profile-on-sign-up trigger (task 2). |
 | `20261116000000_groups_and_rls.sql` | Invite codes, `join_group()` and `rotate_group_invite()`, table grants and the row level security policies (task 4). |
 
-Local Supabase applies them automatically on `npm run db -- start` and `npm run db -- reset`. To apply them to the hosted project with the Supabase CLI, first log in and link the project:
+Local Supabase applies them automatically on `npm run db -- start` and `npm run db -- db reset`. To apply them to the hosted project with the Supabase CLI, first log in and link the project:
 
 ```bash
 npx supabase login
