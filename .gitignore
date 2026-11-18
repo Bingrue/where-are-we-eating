@@ -8,3 +8,7 @@ dist/
 supabase/.temp/
 supabase/.branches/
 *.log
+
+test-results/
+playwright-report/
+benchmarks/results/

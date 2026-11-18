@@ -113,3 +113,20 @@ button:disabled { opacity: 0.6; cursor: default; }
 button.secondary { background: transparent; color: var(--text); border-color: var(--border); }
 button.danger { background: transparent; color: var(--danger); border-color: var(--danger); margin-top: 12px; }
 button.link { background: none; border: 0; padding: 0; color: var(--accent); text-decoration: underline; }
+
+/* Poll screens (Bingrui, task 6). */
+fieldset { padding: 0; margin: 0; border: 0; min-width: 0; }
+select { font: inherit; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); }
+.badge { display: inline-block; padding: 2px 9px; border-radius: 99px; background: var(--bg); color: var(--muted); font-size: .8rem; font-weight: 500; }
+.poll-heading { justify-content: space-between; margin-bottom: 16px; }
+.live-status { font-size: .85rem; color: var(--muted); }
+.live-status.live { color: var(--notice-text); }
+.poll-create { border-top: 1px solid var(--border); padding-top: 20px; margin-top: 20px; }
+.options h3 { margin: 0; overflow-wrap: anywhere; }
+.options h3 .badge { margin-left: 8px; }
+.options p { margin: 4px 0; }
+.option-content { flex: 1 1 160px; min-width: 0; }
+.option-actions { justify-items: end; align-content: center; }
+meter { width: 100%; height: 12px; accent-color: var(--accent); }
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+@media (max-width: 420px) { .card { padding: 16px; } .columns { grid-template-columns: minmax(0, 1fr); } }

@@ -105,3 +105,30 @@ Use the local API URL and publishable key shown by `status` in `client/.env` and
 ```bash
 npm run db -- stop
 ```
+
+## Poll screens and live updates (Bingrui)
+
+Open a group to create a restaurant poll, suggest restaurants, vote and view the
+saved result. Poll screens subscribe to Supabase Postgres Changes and recover
+missed updates after reconnecting. The additional migration
+`20261118000000_poll_realtime.sql` enables publication of existing poll data;
+it does not change RLS policies.
+
+Vote/close actions require Devon's task 5 functions. Their proposed RPC contract,
+frontend and real Realtime tests, CI setup and the 1–50-user latency comparison
+are documented in [Bingrui's handoff](docs/bingrui-handoff.md).
+
+```bash
+npm test
+npm run build
+npx playwright install chromium
+npm run test:browser
+# Requires local Supabase credentials in .env.test:
+npm run test:realtime
+# Also requires Devon's vote RPC:
+npm run bench:realtime
+```
+
+Browser tests use a fake transport to check frontend behavior. Real Realtime
+integration and latency tests are separate commands; no real latency claim is
+made by the frontend test suite.

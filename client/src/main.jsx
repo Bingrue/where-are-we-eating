@@ -7,6 +7,7 @@ import { navigate, usePath } from './router.js';
 import { SessionProvider, useSession } from './session.jsx';
 import { isSupabaseConfigured, supabase } from './supabase.js';
 import './styles.css';
+import { PollPage } from './polls/Polls.jsx';
 
 const PENDING_INVITE = 'pendingInvite';
 
@@ -107,10 +108,11 @@ function App() {
     content = <p className="muted">Joining group…</p>;
   } else {
     const groupId = /^\/groups\/([^/]+)$/.exec(path)?.[1];
+    const pollId = /^\/polls\/([0-9a-f-]{36})$/i.exec(path)?.[1];
     content = (
       <>
         {invite.error && <p className="error" role="alert">{invite.error}</p>}
-        {groupId ? <GroupPage key={groupId} groupId={groupId} userId={session.user.id} /> : <GroupsPage />}
+        {pollId ? <PollPage key={pollId} pollId={pollId} userId={session.user.id} /> : groupId ? <GroupPage key={groupId} groupId={groupId} userId={session.user.id} /> : <GroupsPage />}
       </>
     );
   }
