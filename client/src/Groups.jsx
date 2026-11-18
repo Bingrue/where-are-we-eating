@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api } from './api.js';
+import { GroupPolls } from './polls/Polls.jsx';
 import { inviteLink, navigate } from './router.js';
 
 function useApi(path) {
@@ -188,7 +189,7 @@ export function GroupPage({ groupId, userId }) {
         {isAdmin && <button type="button" className="danger" onClick={deleteGroup}>Delete group</button>}
       </section>
 
-      {/* Bingrui: poll screens for this group go here (task 6). */}
+      <GroupPolls key={groupId} groupId={groupId} />
       {error && <p className="error" role="alert">{error}</p>}
     </>
   );

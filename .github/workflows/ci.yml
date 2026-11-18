@@ -1,0 +1,49 @@
+name: Verify Bingrui frontend
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:browser
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: browser-failures
+          path: test-results/
+  supabase-setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run db -- start
+      - run: npm run db -- db reset
+      - name: Test real Realtime reads and suggestions
+        shell: bash
+        run: |
+          npx supabase status -o env > /tmp/supabase-status.env
+          set -a
+          source /tmp/supabase-status.env
+          set +a
+          SUPABASE_URL="$API_URL" SUPABASE_PUBLISHABLE_KEY="$ANON_KEY" SUPABASE_SECRET_KEY="$SERVICE_ROLE_KEY" npm run test:realtime
+      - run: npm run db -- stop --no-backup
+        if: always()
