@@ -1,44 +1,132 @@
-import { StrictMode, useEffect, useState } from 'react';
+import { StrictMode, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { api } from './api.js';
+import { AuthScreen, NewPasswordScreen } from './AuthScreen.jsx';
+import { GroupPage, GroupsPage } from './Groups.jsx';
+import { navigate, usePath } from './router.js';
+import { SessionProvider, useSession } from './session.jsx';
+import { isSupabaseConfigured, supabase } from './supabase.js';
+import './styles.css';
 
-function App() {
-  const [status, setStatus] = useState('Checking connections…');
+const PENDING_INVITE = 'pendingInvite';
+
+function readPendingInvite() {
+  try {
+    return localStorage.getItem(PENDING_INVITE);
+  } catch {
+    return null;
+  }
+}
+
+function writePendingInvite(code) {
+  try {
+    if (code) localStorage.setItem(PENDING_INVITE, code);
+    else localStorage.removeItem(PENDING_INVITE);
+  } catch {
+    // Storage unavailable: the invite still works while this page stays open.
+  }
+}
+
+// Remember an invite from /join/<code> until the user is signed in, then accept it.
+// localStorage (not sessionStorage) so it survives the email confirmation round trip.
+function useInvite(path, session) {
+  const [pending, setPending] = useState(readPendingInvite);
+  const [error, setError] = useState('');
+  const joining = useRef(false);
 
   useEffect(() => {
-    const controller = new AbortController();
-
-    async function checkApi() {
-      try {
-        const response = await fetch('/api/health', { signal: controller.signal });
-        const data = response.ok ? await response.json() : null;
-        if (data?.status !== 'ok') {
-          setStatus('API unavailable');
-        } else if (data.supabase === 'connected') {
-          setStatus('API and Supabase connected');
-        } else if (data.supabase === 'unavailable') {
-          setStatus('API connected; Supabase unavailable');
-        } else {
-          setStatus('API connected; add Supabase credentials');
-        }
-      } catch {
-        if (!controller.signal.aborted) setStatus('API unavailable');
-      }
+    const code = /^\/join\/([0-9a-f]{32})$/i.exec(path)?.[1];
+    if (code) {
+      writePendingInvite(code);
+      setPending(code);
     }
+  }, [path]);
 
-    checkApi();
-    return () => controller.abort();
-  }, []);
+  useEffect(() => {
+    if (!session || !pending || joining.current) return;
+    joining.current = true;
+    api('/groups/join', { method: 'POST', body: { code: pending } })
+      .then((group) => navigate(`/groups/${group.id}`, { replace: true }))
+      .catch((caught) => {
+        setError(caught.message);
+        navigate('/', { replace: true });
+      })
+      .finally(() => {
+        writePendingInvite(null);
+        setPending(null);
+        joining.current = false;
+      });
+  }, [session, pending]);
+
+  return { pending, error };
+}
+
+function Header({ session }) {
+  const [profile, setProfile] = useState(null);
+
+  useEffect(() => {
+    if (!session) {
+      setProfile(null);
+      return;
+    }
+    api('/me').then(setProfile).catch(() => setProfile(null));
+  }, [session?.user.id]);
 
   return (
-    <main>
-      <h1>Where Are We Eating?</h1>
-      <p role="status">{status}</p>
-    </main>
+    <header>
+      <h1><a href="/" onClick={(event) => { event.preventDefault(); navigate('/'); }}>Where Are We Eating?</a></h1>
+      {session && (
+        <div className="row">
+          <span className="muted">{profile?.display_name || profile?.username || session.user.email}</span>
+          <button type="button" className="secondary" onClick={() => supabase.auth.signOut()}>Sign out</button>
+        </div>
+      )}
+    </header>
+  );
+}
+
+function App() {
+  const path = usePath();
+  const { loading, session, recovering, finishRecovery } = useSession();
+  const invite = useInvite(path, session);
+
+  let content;
+  if (!isSupabaseConfigured) {
+    content = (
+      <section className="card">
+        <p>Add <code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_PUBLISHABLE_KEY</code> to <code>client/.env</code>, then restart <code>npm run dev</code>.</p>
+      </section>
+    );
+  } else if (loading) {
+    content = <p className="muted">Loading…</p>;
+  } else if (recovering || (session && path === '/reset-password')) {
+    content = <NewPasswordScreen onDone={() => { finishRecovery(); navigate('/', { replace: true }); }} />;
+  } else if (!session) {
+    content = <AuthScreen invitePending={Boolean(invite.pending)} />;
+  } else if (invite.pending) {
+    content = <p className="muted">Joining group…</p>;
+  } else {
+    const groupId = /^\/groups\/([^/]+)$/.exec(path)?.[1];
+    content = (
+      <>
+        {invite.error && <p className="error" role="alert">{invite.error}</p>}
+        {groupId ? <GroupPage key={groupId} groupId={groupId} userId={session.user.id} /> : <GroupsPage />}
+      </>
+    );
+  }
+
+  return (
+    <>
+      <Header session={session} />
+      <main>{content}</main>
+    </>
   );
 }
 
 createRoot(document.getElementById('root')).render(
   <StrictMode>
-    <App />
+    <SessionProvider>
+      <App />
+    </SessionProvider>
   </StrictMode>,
 );
