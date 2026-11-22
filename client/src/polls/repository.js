@@ -1,5 +1,4 @@
-// Task 6 adapter. Uses Albion's schema/RLS as the signed-in browser user.
-// Only vote/close RPC names are provisional: agree them with Devon (task 5).
+// Task 6 adapter. Uses the task 5 RPCs for vote writes and vote totals.
 export function createPollRepository(client) {
   function db() {
     if (!client) throw new Error('Please configure Supabase and sign in.');
@@ -25,13 +24,15 @@ export function createPollRepository(client) {
     create: (groupId, question) => unwrap(db().from('polls').insert({ group_id: groupId, question })
       .select('id').single()),
     async read(pollId, userId) {
-      const [poll, own] = await Promise.all([
+      const [poll, own, totals] = await Promise.all([
         unwrap(db().from('polls').select(`id, group_id, question, created_by, status, saved_outcome_option_id,
-          options:options!options_poll_id_fkey(id, restaurant_name, food_category, price_range, created_at, votes(count))`)
+          options:options!options_poll_id_fkey(id, restaurant_name, food_category, price_range, created_at)`)
           .eq('id', pollId).single()),
         unwrap(db().from('votes').select('option_id').eq('poll_id', pollId).eq('user_id', userId).maybeSingle()),
+        unwrap(db().rpc('get_vote_totals', { p_poll_id: pollId })),
       ]);
-      const options = poll.options.map(({ votes, ...option }) => ({ ...option, vote_count: votes?.[0]?.count ?? 0 }))
+      const counts = new Map(totals.map(({ option_id, vote_count }) => [option_id, Number(vote_count)]));
+      const options = poll.options.map((option) => ({ ...option, vote_count: counts.get(option.id) ?? 0 }))
         .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id));
       return { ...poll, options, my_option_id: own?.option_id ?? null };
     },

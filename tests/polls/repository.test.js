@@ -24,7 +24,10 @@ test('read preserves the database saved winner and handles zero counts and own v
     { id: 'later', created_at: '2026-11-19', votes: [{ count: 3 }] },
     { id: 'earlier', created_at: '2026-11-18', votes: [] },
   ] };
-  const client = { from(table) {
+  const client = { rpc: async (name) => {
+    assert.equal(name, 'get_vote_totals');
+    return { data: [{ option_id: 'later', vote_count: 3 }, { option_id: 'earlier', vote_count: 0 }] };
+  }, from(table) {
     const query = { select() { return this; }, eq() { return this; },
       async single() { return { data: poll }; }, async maybeSingle() { return { data: { option_id: 'later' } }; } };
     assert.ok(['polls', 'votes'].includes(table));

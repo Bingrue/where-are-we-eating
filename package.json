@@ -19,6 +19,7 @@
     "db": "supabase",
     "test:rls": "node --env-file-if-exists=.env.test --test --test-reporter=spec \"tests/**/*.test.js\"",
     "bench:rls": "node --env-file-if-exists=.env.test benchmarks/rls-cost.js",
+    "bench:voting": "node --env-file-if-exists=.env.test benchmarks/voting-performance.js",
     "test": "node --test tests/polls/*.test.js",
     "test:browser": "playwright test",
     "bench:realtime": "node --env-file-if-exists=.env.test benchmarks/realtime.js",

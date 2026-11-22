@@ -10,9 +10,10 @@ branch with `albi` as the base. Do not present the whole main-to-branch diff as
 Bingrui's contribution.
 
 Bingrui adds the poll components, data adapter, live subscription/recovery logic,
-Realtime publication migration, frontend tests/CI and latency benchmark. No task 2
-schema, task 3 authentication, task 4 policies or task 5 database functions are
-implemented or replaced here. No application code uses a secret key.
+Realtime publication migration, frontend tests/CI and latency benchmark. Task 5
+was still pending at the time of this handoff; its database functions and
+performance benchmark are now added in this checkout. No task 2 schema, task 3
+authentication or task 4 policies are replaced here. No app code uses a secret key.
 
 ## What works with the current schema
 
@@ -34,35 +35,29 @@ Apply `20261118000000_poll_realtime.sql` after the two teammate migrations to ad
 the existing `polls`, `options` and `votes` tables to `supabase_realtime`. It makes
 no table, privilege or policy changes.
 
-## Task 5 handoff — proposed, not yet confirmed
+## Task 5 voting contract
 
-`client/src/polls/repository.js` is the only place to adapt Devon's final RPC
-names/arguments. Current proposed authenticated RPC contract:
+The database implementation is in `20261119000000_voting_functions_and_indexes.sql`.
+The authenticated RPC contract is:
 
 | Action | RPC | Arguments | Result |
 | --- | --- | --- | --- |
-| Cast/change own vote | `cast_vote` | `p_poll_id uuid`, `p_option_id uuid` | Any successful response; UI refetches |
-| Close poll | `close_poll` | `p_poll_id uuid` | Any successful response; UI refetches |
+| Cast/change own vote | `cast_vote` | `p_poll_id uuid`, `p_option_id uuid` | `void`; UI refetches |
+| Close poll | `close_poll` | `p_poll_id uuid` | Winning option UUID, or null when no votes |
+| Read vote totals | `get_vote_totals` | `p_poll_id uuid` | One row per option with its vote count |
 
-Required database behavior belongs to Devon: enforce group membership, one vote
-per user, option ownership, open-poll checks and locking against close/vote races;
-authorize closing; resolve ties; set `polls.status = 'closed'` and persist the
-winner in `saved_outcome_option_id`. The UI displays that saved choice and does
-not choose a winner itself. A no-vote closure can leave the saved choice null.
+Both write functions lock the poll row, serializing votes against close. Votes
+require group membership and an open poll; a change upserts the same user's vote.
+Only the creator can close. Ties go to the earliest option by `created_at`, then
+UUID; with no votes the saved outcome is null. Authenticated table write grants
+on `votes` are revoked, so clients must use `cast_vote`. The UI displays the saved
+choice and does not choose a winner itself. Close retries return the saved result.
 
-Current RLS allows changing an existing vote. This UI offers “Change vote”; if
-the team's final rule makes votes immutable, remove that action and adapt the
-benchmark's repeated-write fixture with Devon before the final acceptance run.
-The close action is shown to the poll creator; its authorization is still the
-database's responsibility. No direct vote insertion or client-side close fallback
-is provided. A missing RPC produces a user-facing “not available yet” error.
-
-The current read adapter uses RLS-filtered nested `votes(count)` aggregates,
-not a download of every individual vote. If Devon supplies a snapshot/totals RPC,
-replace `read()` in the adapter with that function, keeping the component's
-snapshot shape. Current `read()` uses two queries (poll/options/counts and own
-vote), so it is eventually consistent during concurrent writes, not a transaction
-snapshot. Task 5 can provide transaction-level snapshot consistency.
+`get_vote_totals` is used by the repository read path; individual vote rows
+remain protected by RLS. `benchmarks/voting-performance.js` compares the total
+query with and without `votes_poll_option_idx` at three dataset sizes and emits a
+CSV, SVG chart and plans. Run it with `npm run bench:voting` against local
+Supabase; see `docs/task5-voting-performance.md` for details.
 
 ## Verification
 
@@ -102,7 +97,7 @@ CI runs frontend checks and a separate Docker/Supabase migration + Realtime
 integration job. Workflow success must be checked after pushing; a local build
 does not prove that the remote workflow has run.
 
-## Required latency experiment after task 5 is available
+## Task 6 realtime latency experiment
 
 ```bash
 # Same LOCAL .env.test credentials as above. Never use a shared/hosted database.
@@ -129,9 +124,8 @@ If interrupted by process termination, remove leftover `latency-*` users and the
 
 ## Status of this delivery
 
-The local production build, six unit tests and two Playwright frontend tests
-have passed. The current machine's user cannot access the Docker socket, so the
-real Supabase integration/migration test has not been run locally. No real latency
-numbers are supplied. Full voting/closing acceptance and the latency experiment
-remain dependent on Devon's task 5 functions. Authentication/groups depend on
-merging Albion's PR #1.
+At the time of the task 6 delivery, the local production build, six unit tests and
+two Playwright frontend tests passed. In the current task 5 environment, local
+Supabase and `.env.test` are unavailable, so database integration checks and
+measured voting-performance chart output still need to be generated there.
+Authentication/groups still depend on merging Albion's PR #1.

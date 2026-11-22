@@ -28,6 +28,7 @@ let groupId;
 let inviteCode;
 let pollId;
 let optionId;
+let secondOptionId;
 let strangerGroupId;
 
 async function createUser(name) {
@@ -89,7 +90,12 @@ describe('row level security attacks', { skip: !configured && 'set SUPABASE_URL,
     assert.ifError(option.error);
     optionId = option.data.id;
 
-    const vote = await users.alice.client.from('votes').insert({ poll_id: pollId, option_id: optionId });
+    const secondOption = await users.alice.client.from('options')
+      .insert({ poll_id: pollId, restaurant_name: 'Noodle House' }).select('id').single();
+    assert.ifError(secondOption.error);
+    secondOptionId = secondOption.data.id;
+
+    const vote = await users.alice.client.rpc('cast_vote', { p_poll_id: pollId, p_option_id: optionId });
     assert.ifError(vote.error);
 
     // Mallory has a group of her own, so she is a normal signed-in user.
@@ -123,13 +129,14 @@ describe('row level security attacks', { skip: !configured && 'set SUPABASE_URL,
       assert.equal((await client.from('profiles').select('id').eq('id', users.alice.id)).data.length, 1);
     });
 
-    test('a member can vote and change their own vote', async () => {
-      const { client, id } = users.bob;
-      assert.ifError((await client.from('votes').insert({ poll_id: pollId, option_id: optionId })).error);
-      const changed = await client.from('votes').update({ option_id: optionId }).eq('poll_id', pollId)
-        .eq('user_id', id).select('id');
-      assert.ifError(changed.error);
-      assert.equal(changed.data.length, 1);
+    test('a member can vote and change their own vote through the locking RPC', async () => {
+      const { client } = users.bob;
+      assert.ifError((await client.rpc('cast_vote', { p_poll_id: pollId, p_option_id: secondOptionId })).error);
+      assert.ifError((await client.rpc('cast_vote', { p_poll_id: pollId, p_option_id: optionId })).error);
+      assert.ifError((await client.rpc('cast_vote', { p_poll_id: pollId, p_option_id: secondOptionId })).error);
+      const totals = await client.rpc('get_vote_totals', { p_poll_id: pollId });
+      assert.ifError(totals.error);
+      assert.deepEqual(totals.data.map((row) => Number(row.vote_count)), [1, 1]);
     });
   });
 
@@ -195,6 +202,7 @@ describe('row level security attacks', { skip: !configured && 'set SUPABASE_URL,
       const { client } = users.mallory;
       assertRlsViolation(await client.from('polls').insert({ group_id: groupId, question: 'Hijacked?' }));
       assertRlsViolation(await client.from('options').insert({ poll_id: pollId, restaurant_name: 'Spam Diner' }));
+      assertRlsViolation(await client.rpc('cast_vote', { p_poll_id: pollId, p_option_id: optionId }));
       assertRlsViolation(await client.from('votes').insert({ poll_id: pollId, option_id: optionId }));
     });
 
@@ -263,9 +271,59 @@ describe('row level security attacks', { skip: !configured && 'set SUPABASE_URL,
     });
 
     test('cannot change votes or suggest options once the poll is closed', async () => {
-      // Close the poll as an administrator (task 5's close-poll function will do this).
-      assert.ifError((await admin.from('polls').update({ status: 'closed' }).eq('id', pollId)).error);
+      assertRlsViolation(await users.bob.client.rpc('close_poll', { p_poll_id: pollId }));
+      const closed = await users.alice.client.rpc('close_poll', { p_poll_id: pollId });
+      assert.ifError(closed.error);
+      const persisted = await users.alice.client.from('polls').select('status, saved_outcome_option_id')
+        .eq('id', pollId).single();
+      assert.ifError(persisted.error);
+      assert.equal(persisted.data.status, 'closed');
+      const tieOrder = await users.alice.client.from('options').select('id')
+        .eq('poll_id', pollId).order('created_at').order('id');
+      assert.ifError(tieOrder.error);
+      assert.equal(persisted.data.saved_outcome_option_id, tieOrder.data[0].id);
+      const retriedClose = await users.alice.client.rpc('close_poll', { p_poll_id: pollId });
+      assert.ifError(retriedClose.error);
+      assert.equal(retriedClose.data, tieOrder.data[0].id);
+
+      const emptyPoll = await users.alice.client.from('polls').insert({ group_id: groupId, question: 'No votes?' })
+        .select('id').single();
+      assert.ifError(emptyPoll.error);
+      const emptyOption = await users.alice.client.from('options')
+        .insert({ poll_id: emptyPoll.data.id, restaurant_name: 'Quiet Cafe' }).select('id').single();
+      assert.ifError(emptyOption.error);
+      const zeroTotals = await users.alice.client.rpc('get_vote_totals', { p_poll_id: emptyPoll.data.id });
+      assert.ifError(zeroTotals.error);
+      assert.deepEqual(zeroTotals.data.map((row) => Number(row.vote_count)), [0]);
+      const emptyClose = await users.alice.client.rpc('close_poll', { p_poll_id: emptyPoll.data.id });
+      assert.ifError(emptyClose.error);
+      assert.equal(emptyClose.data, null);
+      const savedEmpty = await users.alice.client.from('polls').select('saved_outcome_option_id')
+        .eq('id', emptyPoll.data.id).single();
+      assert.ifError(savedEmpty.error);
+      assert.equal(savedEmpty.data.saved_outcome_option_id, null);
+
+      const racePoll = await users.alice.client.from('polls').insert({ group_id: groupId, question: 'Close race?' })
+        .select('id').single();
+      assert.ifError(racePoll.error);
+      const raceOption = await users.alice.client.from('options')
+        .insert({ poll_id: racePoll.data.id, restaurant_name: 'Race Cafe' }).select('id').single();
+      assert.ifError(raceOption.error);
+      const [raceClose, raceVote] = await Promise.all([
+        users.alice.client.rpc('close_poll', { p_poll_id: racePoll.data.id }),
+        users.bob.client.rpc('cast_vote', { p_poll_id: racePoll.data.id, p_option_id: raceOption.data.id }),
+      ]);
+      assert.ifError(raceClose.error);
+      assert.ok(!raceVote.error || raceVote.error.code === '55000', raceVote.error?.message);
+      const raceResult = await users.alice.client.from('polls').select('status, saved_outcome_option_id')
+        .eq('id', racePoll.data.id).single();
+      assert.ifError(raceResult.error);
+      assert.equal(raceResult.data.status, 'closed');
+      assert.equal(raceResult.data.saved_outcome_option_id,
+        raceVote.error ? null : raceOption.data.id, 'a vote is either committed before close and counted, or rejected after close');
       const { client, id } = users.bob;
+      const closedVote = await client.rpc('cast_vote', { p_poll_id: pollId, p_option_id: secondOptionId });
+      assert.equal(closedVote.error?.code, '55000');
       assertBlocked(await client.from('votes').update({ option_id: optionId }).eq('user_id', id).select());
       assertBlocked(await client.from('votes').delete().eq('user_id', id).select());
       assertRlsViolation(await client.from('options').insert({ poll_id: pollId, restaurant_name: 'Too late' }));
