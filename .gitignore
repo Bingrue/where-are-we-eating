@@ -3,7 +3,12 @@ dist/
 .env
 .env.*
 !.env.example
+!.env.test.example
 .supabase/
 supabase/.temp/
 supabase/.branches/
 *.log
+
+test-results/
+playwright-report/
+benchmarks/results/

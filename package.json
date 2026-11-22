@@ -16,10 +16,19 @@
     "dev:web": "npm run dev --workspace client",
     "build": "npm run build --workspace client",
     "start": "npm run start --workspace server",
-    "db": "supabase"
+    "db": "supabase",
+    "test:rls": "node --env-file-if-exists=.env.test --test --test-reporter=spec \"tests/**/*.test.js\"",
+    "bench:rls": "node --env-file-if-exists=.env.test benchmarks/rls-cost.js",
+    "bench:voting": "node --env-file-if-exists=.env.test benchmarks/voting-performance.js",
+    "test": "node --test tests/polls/*.test.js",
+    "test:browser": "playwright test",
+    "bench:realtime": "node --env-file-if-exists=.env.test benchmarks/realtime.js",
+    "test:realtime": "node --env-file-if-exists=.env.test --test tests/polls/realtime.integration.js"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.1",
     "concurrently": "^9.2.0",
+    "pg": "^8.23.1",
     "supabase": "^2.54.0"
   },
   "allowScripts": {
