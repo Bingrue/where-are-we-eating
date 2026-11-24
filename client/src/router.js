@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 
-// Minimal client-side routing: /, /groups/<id>, /join/<code>, /reset-password.
+// Minimal client-side routing: /, /groups/<id>, /polls/<id>, /join/<code>, /reset-password.
+// main.jsx decides which screen each path shows.
 export function navigate(path, { replace = false } = {}) {
   if (path === window.location.pathname) return;
   window.history[replace ? 'replaceState' : 'pushState'](null, '', path);
