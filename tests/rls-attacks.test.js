@@ -1,10 +1,11 @@
-// "Attack" tests for task 4: call the Supabase Data API directly (not through Express)
-// as different users and prove that row level security and table grants block every
-// attempt to read or change another group's data.
+// "Attack" tests: call the Supabase Data API directly (not through Express) as different
+// users and prove that row level security and table grants block every attempt to read
+// or change another group's data. They also cover the voting functions (ties, closing
+// with no votes, a vote racing a close) and Express's token checks.
 //
 // Needs SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY and SUPABASE_SECRET_KEY in .env.test.
-// The secret key is used only to create and delete the test users and to close a poll
-// as an administrator would; every attack runs with the publishable key and a user token.
+// The secret key is used only to create and delete the test users and their groups;
+// every attack runs with the publishable key and a user token.
 //
 //   npm run test:rls
 import assert from 'node:assert/strict';
@@ -124,7 +125,7 @@ describe('row level security attacks', { skip: !configured && 'set SUPABASE_URL,
     test('a member can read the poll, options, votes and other members\' profiles', async () => {
       const { client } = users.bob;
       assert.equal((await client.from('polls').select('id').eq('id', pollId)).data.length, 1);
-      assert.equal((await client.from('options').select('id').eq('poll_id', pollId)).data.length, 1);
+      assert.equal((await client.from('options').select('id').eq('poll_id', pollId)).data.length, 2);
       assert.equal((await client.from('votes').select('id').eq('poll_id', pollId)).data.length, 1);
       assert.equal((await client.from('profiles').select('id').eq('id', users.alice.id)).data.length, 1);
     });
@@ -375,6 +376,21 @@ describe('row level security attacks', { skip: !configured && 'set SUPABASE_URL,
       assert.deepEqual((await mine.json()).map((group) => group.id), [strangerGroupId]);
       assert.equal((await get(`/groups/${groupId}`, users.mallory.token)).status, 404);
       assert.equal((await get(`/groups/${groupId}`, users.bob.token)).status, 200);
+    });
+
+    test('explains a missing profile instead of failing with a generic error', async () => {
+      // Accounts created before the sign-up trigger existed have no profile row.
+      const orphan = await createUser('orphan');
+      users.orphan = orphan;
+      assert.ifError((await admin.from('profiles').delete().eq('id', orphan.id)).error);
+
+      const response = await fetch(`${base}/groups`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${orphan.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'No profile' }),
+      });
+      assert.equal(response.status, 409);
+      assert.match((await response.json()).error, /no profile yet/);
     });
   });
 });

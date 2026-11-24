@@ -1,5 +1,12 @@
 # Bingrui: tasks 1 and 6
 
+> This is the handoff note written when tasks 1 and 6 were delivered (Nov 18), kept as a
+> record of that work. Statements about what was pending or unverified describe that
+> date: all branches are now merged, and the tests and benchmarks below have since been
+> run against local Supabase. For the current state of the project see
+> [architecture.md](architecture.md), [supabase.md](supabase.md) and
+> [development.md](development.md).
+
 ## Baseline and ownership
 
 This branch starts at Albion's existing `albi` commit

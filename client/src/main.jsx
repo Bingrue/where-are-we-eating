@@ -3,11 +3,11 @@ import { createRoot } from 'react-dom/client';
 import { api } from './api.js';
 import { AuthScreen, NewPasswordScreen } from './AuthScreen.jsx';
 import { GroupPage, GroupsPage } from './Groups.jsx';
+import { PollPage } from './polls/Polls.jsx';
 import { navigate, usePath } from './router.js';
 import { SessionProvider, useSession } from './session.jsx';
 import { isSupabaseConfigured, supabase } from './supabase.js';
 import './styles.css';
-import { PollPage } from './polls/Polls.jsx';
 
 const PENDING_INVITE = 'pendingInvite';
 
@@ -109,10 +109,13 @@ function App() {
   } else {
     const groupId = /^\/groups\/([^/]+)$/.exec(path)?.[1];
     const pollId = /^\/polls\/([0-9a-f-]{36})$/i.exec(path)?.[1];
+    let page = <GroupsPage />;
+    if (pollId) page = <PollPage key={pollId} pollId={pollId} userId={session.user.id} />;
+    else if (groupId) page = <GroupPage key={groupId} groupId={groupId} userId={session.user.id} />;
     content = (
       <>
         {invite.error && <p className="error" role="alert">{invite.error}</p>}
-        {pollId ? <PollPage key={pollId} pollId={pollId} userId={session.user.id} /> : groupId ? <GroupPage key={groupId} groupId={groupId} userId={session.user.id} /> : <GroupsPage />}
+        {page}
       </>
     );
   }
