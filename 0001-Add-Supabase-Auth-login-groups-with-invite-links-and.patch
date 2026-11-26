@@ -1,0 +1,2593 @@
+From 53a597b55756ae2879e4637f2017451eb906a416 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 19:49:19 +0000
+Subject: [PATCH] Add Supabase Auth login, groups with invite links, and RLS
+
+Task 3 (login):
+- Sign-up, sign-in, sign-out and password reset screens using Supabase Auth
+  (signUp, signInWithPassword, resetPasswordForEmail, updateUser). The session
+  is kept and refreshed by supabase-js and tracked with onAuthStateChange.
+- The client sends the access token to Express as a Bearer token. Express
+  verifies it with supabase.auth.getClaims() and queries Supabase as that user,
+  so row level security applies to every API call.
+
+Task 4 (groups and RLS):
+- Record the hosted core schema as a migration so local Supabase and clean
+  clones can rebuild it.
+- Add invite codes, join_group() and rotate_group_invite(), a trigger that makes
+  a group's creator its admin, tighter table grants, and RLS policies on all
+  six tables.
+- Express routes and React screens to create, join, view and leave groups.
+- Attack tests that call the Supabase API directly as an outsider and as a
+  member, plus Express token checks (npm run test:rls).
+- A benchmark of RLS cost against hand-written membership checks at three
+  data sizes (npm run bench:rls).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0151zCGN8YUEXCRFRRgPeyAo
+---
+ .env.test.example                             |   7 +
+ .gitignore                                    |   1 +
+ README.md                                     |  85 ++++-
+ benchmarks/rls-cost.js                        | 215 ++++++++++++
+ client/.env.example                           |   4 +
+ client/src/AuthScreen.jsx                     | 164 +++++++++
+ client/src/Groups.jsx                         | 195 +++++++++++
+ client/src/api.js                             |  33 ++
+ client/src/main.jsx                           | 146 ++++++--
+ client/src/router.js                          |  22 ++
+ client/src/session.jsx                        |  43 +++
+ client/src/styles.css                         | 115 +++++++
+ client/src/supabase.js                        |  15 +
+ package-lock.json                             | 161 +++++++++
+ package.json                                  |   5 +-
+ server/.env.example                           |   5 +
+ server/app.js                                 |  53 +++
+ server/auth.js                                |  37 ++
+ server/errors.js                              |  35 ++
+ server/index.js                               |  29 +-
+ server/routes/groups.js                       | 133 ++++++++
+ server/routes/me.js                           |  39 +++
+ server/supabase.js                            |  32 ++
+ supabase/config.toml                          |   2 +-
+ .../migrations/20261114000000_core_schema.sql |  96 ++++++
+ .../20261116000000_groups_and_rls.sql         | 265 ++++++++++++++
+ tests/rls-attacks.test.js                     | 322 ++++++++++++++++++
+ 27 files changed, 2191 insertions(+), 68 deletions(-)
+ create mode 100644 .env.test.example
+ create mode 100644 benchmarks/rls-cost.js
+ create mode 100644 client/.env.example
+ create mode 100644 client/src/AuthScreen.jsx
+ create mode 100644 client/src/Groups.jsx
+ create mode 100644 client/src/api.js
+ create mode 100644 client/src/router.js
+ create mode 100644 client/src/session.jsx
+ create mode 100644 client/src/styles.css
+ create mode 100644 client/src/supabase.js
+ create mode 100644 server/.env.example
+ create mode 100644 server/app.js
+ create mode 100644 server/auth.js
+ create mode 100644 server/errors.js
+ create mode 100644 server/routes/groups.js
+ create mode 100644 server/routes/me.js
+ create mode 100644 server/supabase.js
+ create mode 100644 supabase/migrations/20261114000000_core_schema.sql
+ create mode 100644 supabase/migrations/20261116000000_groups_and_rls.sql
+ create mode 100644 tests/rls-attacks.test.js
+
+diff --git a/.env.test.example b/.env.test.example
+new file mode 100644
+index 0000000..f539938
+--- /dev/null
++++ b/.env.test.example
+@@ -0,0 +1,7 @@
++# Used only by `npm run test:rls` and `npm run bench:rls`. Point these at LOCAL Supabase
++# (values from `npm run db -- status`). The secret key bypasses RLS: never commit it,
++# never put it in client/.env, and never use it in the Express app.
++SUPABASE_URL=http://127.0.0.1:54321
++SUPABASE_PUBLISHABLE_KEY=replace-with-local-publishable-key
++SUPABASE_SECRET_KEY=replace-with-local-secret-key
++DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:54322/postgres
+diff --git a/.gitignore b/.gitignore
+index ebdc696..74acefa 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -3,6 +3,7 @@ dist/
+ .env
+ .env.*
+ !.env.example
++!.env.test.example
+ .supabase/
+ supabase/.temp/
+ supabase/.branches/
+diff --git a/README.md b/README.md
+index 5b64358..aa94aaa 100644
+--- a/README.md
++++ b/README.md
+@@ -1,6 +1,6 @@
+ # Where Are We Eating?
+ 
+-A group restaurant polling app with a React frontend, an Express API, and Supabase connectivity.
++A group restaurant polling app with a React frontend, an Express API, and Supabase for the database, sign-in and row level security.
+ 
+ ## Run the app
+ 
+@@ -15,27 +15,92 @@ Open [http://localhost:5173](http://localhost:5173). The frontend runs on port 5
+ 
+ ## Connect to Supabase
+ 
+-The API reads the Supabase project URL and publishable key from `server/.env`. Create that file with the credentials for your Supabase project:
++Both the browser and the API use the project URL and the **publishable** key. Copy the examples and fill them in:
+ 
+-```env
+-SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
+-SUPABASE_PUBLISHABLE_KEY=YOUR_SUPABASE_PUBLISHABLE_KEY
++```bash
++cp client/.env.example client/.env
++cp server/.env.example server/.env
++```
++
++Get the values from your Supabase project's **Connect** dialog or **Project Settings → API Keys**, or from `npm run db -- status` for local Supabase. Restart `npm run dev` after changing them. Never put the secret (service role) key in either file: the app does not need it.
++
++## Database migrations
++
++The schema lives in `supabase/migrations/`:
++
++| Migration | What it does |
++| --- | --- |
++| `20261114000000_core_schema.sql` | The six tables, keys, one-vote-per-user rule, “option belongs to this poll” rule and the profile-on-sign-up trigger (task 2). |
++| `20261116000000_groups_and_rls.sql` | Invite codes, `join_group()` and `rotate_group_invite()`, table grants and the row level security policies (task 4). |
++
++Local Supabase applies them automatically on `npm run db -- start` and `npm run db -- reset`. To apply them to the hosted project with the Supabase CLI, first log in and link the project:
++
++```bash
++npx supabase login
+ ```
+ 
+-Get these values from your Supabase project's **Connect** dialog or its API settings. Keep the key in `.env`; do not commit credentials. Restart the dev server after changing the file. The API health endpoint checks Supabase Auth and reports `connected`, `unavailable`, or `not_configured`.
++```bash
++npx supabase link --project-ref YOUR_PROJECT_REF
++```
++
++The hosted project already contains the core schema, so mark that migration as applied once instead of running it again:
++
++```bash
++npx supabase migration repair --status applied 20261114000000
++```
++
++Then push the remaining migrations:
++
++```bash
++npx supabase db push
++```
++
++## How sign-in works (Supabase Auth)
++
++- The React app signs users up and in with `supabase.auth.signUp()` and `supabase.auth.signInWithPassword()`. The username and display name are sent as user metadata, and the `on_auth_user_created` trigger copies them into `public.profiles`.
++- Supabase Auth stores the session in the browser, refreshes the access token before it expires, and reports changes through `onAuthStateChange`. Password resets use `resetPasswordForEmail()` and `updateUser()`.
++- Every API request sends `Authorization: Bearer <access token>`. Express verifies it with `supabase.auth.getClaims()` (`server/auth.js`) and rejects missing, expired or forged tokens with 401.
++- Express then queries Supabase **as that user** by forwarding the same token, so `auth.uid()` is the user's id and row level security applies to every query. Express never bypasses RLS.
++
++## Groups and row level security
++
++- Creating a group inserts into `groups`; a trigger makes the creator its admin.
++- Invite links look like `/join/<code>`. The code is 32 random hex characters, and only `join_group(code)` can add someone to a group. Admins can replace the code with **New link**.
++- Policies let users read only the groups they belong to and the polls, options, votes and profiles of those groups. Members can create polls, suggest options and cast, change or remove their own vote while a poll is open. Admins can rename or delete the group and remove members.
++- Signed-out (`anon`) requests have no table privileges at all.
++
++### Attack tests
++
++`tests/rls-attacks.test.js` calls the Supabase API directly as three users (an admin, a member and an outsider) and checks that every attempt to read or change another group's data is blocked. It also checks that Express rejects missing, malformed and forged tokens. Run it against local Supabase:
++
++```bash
++npm run db -- start
++cp .env.test.example .env.test
++npm run test:rls
++```
++
++Fill `.env.test` with the API URL, publishable key and secret key from `npm run db -- status`. The secret key is used only to create and delete the test users.
++
++### Cost of RLS
++
++`benchmarks/rls-cost.js` seeds three data sizes (50, 500 and 5,000 groups) inside a transaction that is rolled back. It times the app's main queries under RLS and as hand-written membership checks with RLS bypassed, which is what an Express-only app would do. Run it against local Supabase:
++
++```bash
++npm run bench:rls
++```
+ 
+-Supabase is optional for starting the frontend and API. Without credentials, the app still runs and reports that Supabase is not configured. The current integration checks connectivity; it does not yet read or write poll data.
++Results are written to `benchmarks/results/rls-cost.csv`, with query plans in `benchmarks/results/rls-plans.txt`.
+ 
+-## Use local Supabase (optional)
++## Use local Supabase
+ 
+-To run a local Supabase stack, install and start Docker, then run from the repository root:
++Install and start Docker, then run from the repository root:
+ 
+ ```bash
+ npm run db -- start
+ npm run db -- status
+ ```
+ 
+-Use the local API URL and publishable key shown by `status` in `server/.env`. Local Supabase Studio is available at [http://127.0.0.1:54323](http://127.0.0.1:54323). Stop the local stack when finished:
++Use the local API URL and publishable key shown by `status` in `client/.env` and `server/.env`. Local Supabase Studio is at [http://127.0.0.1:54323](http://127.0.0.1:54323), and emails sent by local Auth (confirmations, password resets) appear at [http://127.0.0.1:54324](http://127.0.0.1:54324). Stop the stack when finished:
+ 
+ ```bash
+ npm run db -- stop
+diff --git a/benchmarks/rls-cost.js b/benchmarks/rls-cost.js
+new file mode 100644
+index 0000000..d47c314
+--- /dev/null
++++ b/benchmarks/rls-cost.js
+@@ -0,0 +1,215 @@
++// Measures what row level security costs (task 4).
++//
++// For three data sizes it seeds synthetic users, groups, polls, options and votes,
++// then times the app's typical queries two ways:
++//   rls       as the `authenticated` role with a user's JWT claims, so RLS filters rows
++//             (how the app really runs: Express forwards the user's token to Supabase)
++//   app_check as the table owner (RLS bypassed) with the same membership check written
++//             into the query by hand (how an Express-only app without RLS would do it)
++// Each size runs inside a transaction that is rolled back, so nothing is left behind.
++//
++// Run it against LOCAL Supabase (it inserts into auth.users):
++//   npm run db -- start
++//   npm run bench:rls
++// DATABASE_URL defaults to the local stack. Results go to benchmarks/results/.
++import { mkdir, writeFile } from 'node:fs/promises';
++import pg from 'pg';
++
++const databaseUrl = process.env.DATABASE_URL ?? 'postgresql://postgres:postgres@127.0.0.1:54322/postgres';
++const runs = Number(process.env.BENCH_RUNS ?? 30);
++const warmup = 5;
++const resultsDir = new URL('./results/', import.meta.url);
++
++// groups at each size; every group has 8 members, 4 polls, 5 options per poll,
++// and every member votes in every poll. Each user belongs to about 3 groups.
++const sizes = [
++  { name: 'small', groups: 50 },
++  { name: 'medium', groups: 500 },
++  { name: 'large', groups: 5000 },
++];
++const membersPerGroup = 8;
++const groupsPerUser = 3;
++
++const queries = [
++  {
++    name: 'list my groups',
++    rls: 'select id, name from public.groups order by name',
++    appCheck: `select g.id, g.name from public.groups g
++      join public.group_members m on m.group_id = g.id
++      where m.user_id = $1 order by g.name`,
++  },
++  {
++    name: 'polls in a group',
++    rls: 'select id, question, status from public.polls where group_id = $2 order by created_at desc',
++    appCheck: `select id, question, status from public.polls where group_id = $2
++      and exists (select 1 from public.group_members m where m.group_id = $2 and m.user_id = $1)
++      order by created_at desc`,
++  },
++  {
++    name: 'vote totals for a poll',
++    rls: `select o.id, o.restaurant_name, count(v.id) as votes
++      from public.options o left join public.votes v on v.option_id = o.id and v.poll_id = o.poll_id
++      where o.poll_id = $3 group by o.id, o.restaurant_name order by votes desc`,
++    appCheck: `select o.id, o.restaurant_name, count(v.id) as votes
++      from public.options o left join public.votes v on v.option_id = o.id and v.poll_id = o.poll_id
++      where o.poll_id = $3
++        and exists (select 1 from public.polls p join public.group_members m on m.group_id = p.group_id
++                    where p.id = $3 and m.user_id = $1)
++      group by o.id, o.restaurant_name order by votes desc`,
++  },
++  {
++    name: 'members with profiles',
++    rls: `select m.user_id, m.role, p.display_name from public.group_members m
++      join public.profiles p on p.id = m.user_id where m.group_id = $2`,
++    appCheck: `select m.user_id, m.role, p.display_name from public.group_members m
++      join public.profiles p on p.id = m.user_id where m.group_id = $2
++        and exists (select 1 from public.group_members me where me.group_id = $2 and me.user_id = $1)`,
++  },
++];
++
++async function seed(client, groupCount) {
++  const userCount = Math.ceil((groupCount * membersPerGroup) / groupsPerUser);
++  await client.query(`
++    create temp table bench_users on commit drop as
++      select gen_random_uuid() as id, n from generate_series(1, $1) n;
++    insert into auth.users (id, instance_id, aud, role, email, raw_user_meta_data, created_at, updated_at)
++      select id, '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated',
++        'bench-' || n || '@example.com', jsonb_build_object('display_name', 'User ' || n), now(), now()
++      from bench_users;
++
++    create temp table bench_groups on commit drop as
++      select gen_random_uuid() as id, n from generate_series(1, $2) n;
++    -- The creator trigger makes member slot 0 of each group its admin.
++    insert into public.groups (id, name, created_by)
++      select g.id, 'Group ' || g.n, u.id
++      from bench_groups g join bench_users u on u.n = ((g.n - 1) * $3) % $1 + 1;
++    insert into public.group_members (group_id, user_id)
++      select g.id, u.id
++      from bench_groups g
++      cross join generate_series(1, $3 - 1) slot
++      join bench_users u on u.n = ((g.n - 1) * $3 + slot) % $1 + 1
++      on conflict do nothing;
++
++    insert into public.polls (group_id, created_by, question)
++      select g.id, g.created_by, 'Poll ' || p
++      from public.groups g, generate_series(1, 4) p;
++    insert into public.options (poll_id, restaurant_name)
++      select p.id, 'Restaurant ' || o from public.polls p, generate_series(1, 5) o;
++    insert into public.votes (poll_id, option_id, user_id)
++      select p.id,
++        (select o.id from public.options o where o.poll_id = p.id
++         order by o.restaurant_name offset (abs(hashtext(m.user_id::text || p.id::text)) % 5) limit 1),
++        m.user_id
++      from public.polls p join public.group_members m on m.group_id = p.group_id;
++    analyze public.profiles, public.groups, public.group_members, public.polls, public.options, public.votes;
++  `.replace(/\$1/g, userCount).replace(/\$2/g, groupCount).replace(/\$3/g, membersPerGroup));
++
++  const counts = await client.query(`select
++      (select count(*) from public.profiles)::int as profiles,
++      (select count(*) from public.groups)::int as groups,
++      (select count(*) from public.group_members)::int as group_members,
++      (select count(*) from public.polls)::int as polls,
++      (select count(*) from public.options)::int as options,
++      (select count(*) from public.votes)::int as votes`);
++
++  // A typical user: in the median number of groups.
++  const probe = await client.query(`
++    select m.user_id, m.group_id, p.id as poll_id
++    from public.group_members m join public.polls p on p.group_id = m.group_id
++    where m.user_id = (
++      select user_id from public.group_members group by user_id
++      order by abs(count(*) - $1), user_id limit 1)
++    limit 1`, [groupsPerUser]);
++  return { counts: counts.rows[0], probe: probe.rows[0] };
++}
++
++// The ids are uuids this script read from the database, so they are inlined as literals.
++// That also gives both modes the same custom plan instead of a generic prepared plan.
++function bind(sql, params) {
++  return sql.replace(/\$(\d)/g, (_match, index) => `'${params[index - 1]}'::uuid`);
++}
++
++async function explain(client, sql, params) {
++  const { rows } = await client.query(`explain (analyze, buffers, format json) ${bind(sql, params)}`);
++  const plan = rows[0]['QUERY PLAN'][0];
++  return { execution: plan['Execution Time'], planning: plan['Planning Time'], rows: plan.Plan['Actual Rows'] };
++}
++
++async function explainText(client, sql, params) {
++  const { rows } = await client.query(`explain (analyze, costs off, timing off, summary off) ${bind(sql, params)}`);
++  return rows.map((row) => row['QUERY PLAN']).join('\n');
++}
++
++async function setMode(client, mode, userId) {
++  if (mode === 'rls') {
++    await client.query("set local role authenticated");
++    await client.query("select set_config('request.jwt.claims', $1, true)",
++      [JSON.stringify({ sub: userId, role: 'authenticated' })]);
++  } else {
++    await client.query('reset role');
++  }
++}
++
++function summarize(values) {
++  const sorted = [...values].sort((a, b) => a - b);
++  const at = (q) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
++  return { median: at(0.5), p95: at(0.95) };
++}
++
++async function measure(client, mode, sql, params, userId) {
++  await setMode(client, mode, userId);
++  for (let i = 0; i < warmup; i += 1) await explain(client, sql, params);
++  const totals = [];
++  let rows = 0;
++  for (let i = 0; i < runs; i += 1) {
++    const result = await explain(client, sql, params);
++    totals.push(result.execution + result.planning);
++    rows = result.rows;
++  }
++  const plan = await explainText(client, sql, params);
++  await setMode(client, 'app_check');
++  return { ...summarize(totals), rows, plan };
++}
++
++const client = new pg.Client({ connectionString: databaseUrl });
++await client.connect();
++await mkdir(resultsDir, { recursive: true });
++
++const csv = ['size,groups,votes,query,mode,median_ms,p95_ms,rows'];
++const plans = [];
++
++try {
++  for (const size of sizes) {
++    await client.query('begin');
++    try {
++      const started = Date.now();
++      const { counts, probe } = await seed(client, size.groups);
++      console.log(`\n${size.name}: ${JSON.stringify(counts)} (seeded in ${Date.now() - started} ms)`);
++      const params = [probe.user_id, probe.group_id, probe.poll_id];
++
++      for (const query of queries) {
++        const rls = await measure(client, 'rls', query.rls, params, probe.user_id);
++        const app = await measure(client, 'app_check', query.appCheck, params, probe.user_id);
++        if (rls.rows !== app.rows) {
++          throw new Error(`${query.name}: RLS returned ${rls.rows} rows but the app check returned ${app.rows}`);
++        }
++        const overhead = rls.median - app.median;
++        console.log(`  ${query.name.padEnd(24)} rls ${rls.median.toFixed(3)} ms  app_check ${app.median.toFixed(3)} ms`
++          + `  overhead ${overhead >= 0 ? '+' : ''}${overhead.toFixed(3)} ms  (${rls.rows} rows)`);
++        for (const [mode, result] of [['rls', rls], ['app_check', app]]) {
++          csv.push([size.name, counts.groups, counts.votes, `"${query.name}"`, mode,
++            result.median.toFixed(4), result.p95.toFixed(4), result.rows].join(','));
++          plans.push(`### ${size.name} / ${query.name} / ${mode}\n${result.plan}\n`);
++        }
++      }
++    } finally {
++      await client.query('rollback');
++    }
++  }
++} finally {
++  await client.end();
++}
++
++await writeFile(new URL('rls-cost.csv', resultsDir), `${csv.join('\n')}\n`);
++await writeFile(new URL('rls-plans.txt', resultsDir), plans.join('\n'));
++console.log('\nWrote benchmarks/results/rls-cost.csv and benchmarks/results/rls-plans.txt');
+diff --git a/client/.env.example b/client/.env.example
+new file mode 100644
+index 0000000..fc79f0d
+--- /dev/null
++++ b/client/.env.example
+@@ -0,0 +1,4 @@
++# Supabase project URL and publishable key (safe to expose in the browser).
++# Hosted: Project Settings → API Keys / the Connect dialog. Local: `npm run db -- status`.
++VITE_SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
++VITE_SUPABASE_PUBLISHABLE_KEY=replace-with-your-publishable-key
+diff --git a/client/src/AuthScreen.jsx b/client/src/AuthScreen.jsx
+new file mode 100644
+index 0000000..335e59c
+--- /dev/null
++++ b/client/src/AuthScreen.jsx
+@@ -0,0 +1,164 @@
++import { useState } from 'react';
++import { supabase } from './supabase.js';
++
++const usernamePattern = /^[a-z0-9_]{3,20}$/;
++
++// Supabase Auth reports a failure in our on_auth_user_created trigger as a generic
++// database error. The only constraint that trigger can break is the unique username.
++function describeAuthError(error) {
++  if (/database error saving new user/i.test(error.message)) {
++    return 'That username is already taken.';
++  }
++  if (error.code === 'over_email_send_rate_limit') {
++    return 'Too many emails were sent. Wait a few minutes and try again.';
++  }
++  return error.message;
++}
++
++export function AuthScreen({ invitePending }) {
++  const [mode, setMode] = useState('sign-in');
++  const [form, setForm] = useState({ email: '', password: '', username: '', displayName: '' });
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState('');
++  const [notice, setNotice] = useState('');
++
++  const update = (field) => (event) => setForm({ ...form, [field]: event.target.value });
++
++  function switchMode(next) {
++    setMode(next);
++    setError('');
++    setNotice('');
++  }
++
++  async function submit(event) {
++    event.preventDefault();
++    setBusy(true);
++    setError('');
++    setNotice('');
++
++    try {
++      if (mode === 'sign-in') {
++        const { error: authError } = await supabase.auth.signInWithPassword({
++          email: form.email,
++          password: form.password,
++        });
++        if (authError) throw authError;
++        // onAuthStateChange (SIGNED_IN) takes it from here.
++      } else if (mode === 'sign-up') {
++        const username = form.username.trim().toLowerCase();
++        if (!usernamePattern.test(username)) {
++          throw new Error('Usernames are 3–20 lowercase letters, numbers or underscores.');
++        }
++        const { data, error: authError } = await supabase.auth.signUp({
++          email: form.email,
++          password: form.password,
++          options: {
++            // Stored in auth.users.raw_user_meta_data; the on_auth_user_created
++            // trigger copies them into public.profiles.
++            data: { username, display_name: form.displayName.trim() || username },
++            // Where the confirmation email sends the user back to.
++            emailRedirectTo: window.location.href,
++          },
++        });
++        if (authError) throw authError;
++        if (!data.session) {
++          // Email confirmation is on: Supabase sent a confirmation link.
++          setNotice('Check your email and open the confirmation link to finish signing up.');
++          setMode('sign-in');
++        }
++      } else {
++        const { error: authError } = await supabase.auth.resetPasswordForEmail(form.email, {
++          redirectTo: `${window.location.origin}/reset-password`,
++        });
++        if (authError) throw authError;
++        setNotice('If that email has an account, a password reset link is on its way.');
++      }
++    } catch (caught) {
++      setError(describeAuthError(caught));
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  const title = { 'sign-in': 'Sign in', 'sign-up': 'Create an account', reset: 'Reset your password' }[mode];
++
++  return (
++    <section className="card narrow">
++      <h2>{title}</h2>
++      {invitePending && <p className="notice">Sign in or create an account to join the group you were invited to.</p>}
++
++      <form onSubmit={submit} className="stack">
++        {mode === 'sign-up' && (
++          <>
++            <label>
++              Display name
++              <input value={form.displayName} onChange={update('displayName')} maxLength={60}
++                autoComplete="name" placeholder="How friends see you" />
++            </label>
++            <label>
++              Username
++              <input value={form.username} onChange={update('username')} required maxLength={20}
++                autoComplete="username" placeholder="lowercase_letters_123" />
++            </label>
++          </>
++        )}
++        <label>
++          Email
++          <input type="email" value={form.email} onChange={update('email')} required autoComplete="email" />
++        </label>
++        {mode !== 'reset' && (
++          <label>
++            Password
++            <input type="password" value={form.password} onChange={update('password')} required minLength={6}
++              autoComplete={mode === 'sign-up' ? 'new-password' : 'current-password'} />
++          </label>
++        )}
++
++        {error && <p className="error" role="alert">{error}</p>}
++        {notice && <p className="notice" role="status">{notice}</p>}
++
++        <button type="submit" disabled={busy}>
++          {busy ? 'Please wait…' : { 'sign-in': 'Sign in', 'sign-up': 'Create account', reset: 'Send reset link' }[mode]}
++        </button>
++      </form>
++
++      <p className="links">
++        {mode !== 'sign-in' && <button type="button" className="link" onClick={() => switchMode('sign-in')}>Sign in</button>}
++        {mode !== 'sign-up' && <button type="button" className="link" onClick={() => switchMode('sign-up')}>Create an account</button>}
++        {mode !== 'reset' && <button type="button" className="link" onClick={() => switchMode('reset')}>Forgot password?</button>}
++      </p>
++    </section>
++  );
++}
++
++// Shown after the user opens a password reset link (PASSWORD_RECOVERY event).
++export function NewPasswordScreen({ onDone }) {
++  const [password, setPassword] = useState('');
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState('');
++
++  async function submit(event) {
++    event.preventDefault();
++    setBusy(true);
++    setError('');
++    const { error: authError } = await supabase.auth.updateUser({ password });
++    setBusy(false);
++    if (authError) setError(authError.message);
++    else onDone();
++  }
++
++  return (
++    <section className="card narrow">
++      <h2>Choose a new password</h2>
++      <form onSubmit={submit} className="stack">
++        <label>
++          New password
++          <input type="password" value={password} onChange={(event) => setPassword(event.target.value)}
++            required minLength={6} autoComplete="new-password" />
++        </label>
++        {error && <p className="error" role="alert">{error}</p>}
++        <button type="submit" disabled={busy}>{busy ? 'Saving…' : 'Save password'}</button>
++      </form>
++    </section>
++  );
++}
+diff --git a/client/src/Groups.jsx b/client/src/Groups.jsx
+new file mode 100644
+index 0000000..1b0bb09
+--- /dev/null
++++ b/client/src/Groups.jsx
+@@ -0,0 +1,195 @@
++import { useCallback, useEffect, useState } from 'react';
++import { api } from './api.js';
++import { inviteLink, navigate } from './router.js';
++
++function useApi(path) {
++  const [state, setState] = useState({ loading: true, data: null, error: '' });
++
++  const reload = useCallback(async () => {
++    try {
++      const data = await api(path);
++      setState({ loading: false, data, error: '' });
++    } catch (error) {
++      setState({ loading: false, data: null, error: error.message });
++    }
++  }, [path]);
++
++  useEffect(() => {
++    reload();
++  }, [reload]);
++
++  return { ...state, reload };
++}
++
++export function GroupsPage() {
++  const groups = useApi('/groups');
++  const [name, setName] = useState('');
++  const [code, setCode] = useState('');
++  const [error, setError] = useState('');
++  const [busy, setBusy] = useState(false);
++
++  async function run(action) {
++    setBusy(true);
++    setError('');
++    try {
++      await action();
++    } catch (caught) {
++      setError(caught.message);
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  const createGroup = (event) => {
++    event.preventDefault();
++    run(async () => {
++      const group = await api('/groups', { method: 'POST', body: { name } });
++      setName('');
++      navigate(`/groups/${group.id}`);
++    });
++  };
++
++  const joinGroup = (event) => {
++    event.preventDefault();
++    run(async () => {
++      const group = await api('/groups/join', { method: 'POST', body: { code } });
++      setCode('');
++      navigate(`/groups/${group.id}`);
++    });
++  };
++
++  return (
++    <>
++      <section className="card">
++        <h2>Your groups</h2>
++        {groups.loading && <p>Loading…</p>}
++        {groups.error && <p className="error">{groups.error}</p>}
++        {groups.data?.length === 0 && <p className="muted">You are not in any groups yet. Create one or join with an invite link.</p>}
++        <ul className="list">
++          {groups.data?.map((group) => (
++            <li key={group.id}>
++              <a href={`/groups/${group.id}`} onClick={(event) => { event.preventDefault(); navigate(`/groups/${group.id}`); }}>
++                {group.name}
++              </a>
++              <span className="muted">
++                {group.member_count} {group.member_count === 1 ? 'member' : 'members'} · {group.my_role}
++              </span>
++            </li>
++          ))}
++        </ul>
++      </section>
++
++      <div className="columns">
++        <section className="card">
++          <h3>Create a group</h3>
++          <form onSubmit={createGroup} className="stack">
++            <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Friday lunch crew"
++              maxLength={80} required aria-label="Group name" />
++            <button type="submit" disabled={busy}>Create group</button>
++          </form>
++        </section>
++        <section className="card">
++          <h3>Join a group</h3>
++          <form onSubmit={joinGroup} className="stack">
++            <input value={code} onChange={(event) => setCode(event.target.value)} placeholder="Paste an invite link"
++              required aria-label="Invite link or code" />
++            <button type="submit" disabled={busy}>Join group</button>
++          </form>
++        </section>
++      </div>
++      {error && <p className="error" role="alert">{error}</p>}
++    </>
++  );
++}
++
++export function GroupPage({ groupId, userId }) {
++  const group = useApi(`/groups/${groupId}`);
++  const [error, setError] = useState('');
++  const [copied, setCopied] = useState(false);
++
++  async function act(action) {
++    setError('');
++    try {
++      await action();
++    } catch (caught) {
++      setError(caught.message);
++    }
++  }
++
++  if (group.loading) return <section className="card"><p>Loading…</p></section>;
++  if (group.error) {
++    return (
++      <section className="card">
++        <p className="error">{group.error}</p>
++        <button type="button" className="link" onClick={() => navigate('/')}>Back to your groups</button>
++      </section>
++    );
++  }
++
++  const data = group.data;
++  const isAdmin = data.my_role === 'admin';
++  const link = inviteLink(data.invite_code);
++
++  const copyLink = () => act(async () => {
++    await navigator.clipboard.writeText(link);
++    setCopied(true);
++    setTimeout(() => setCopied(false), 2000);
++  });
++  const rotateLink = () => act(async () => {
++    await api(`/groups/${groupId}/invite`, { method: 'POST' });
++    await group.reload();
++  });
++  const removeMember = (memberId) => act(async () => {
++    await api(`/groups/${groupId}/members/${memberId}`, { method: 'DELETE' });
++    if (memberId === userId) navigate('/');
++    else await group.reload();
++  });
++  const deleteGroup = () => act(async () => {
++    if (!window.confirm(`Delete ${data.name} and all of its polls?`)) return;
++    await api(`/groups/${groupId}`, { method: 'DELETE' });
++    navigate('/');
++  });
++
++  return (
++    <>
++      <p><button type="button" className="link" onClick={() => navigate('/')}>← Your groups</button></p>
++      <section className="card">
++        <h2>{data.name}</h2>
++        <h3>Invite link</h3>
++        <p className="muted">Anyone with this link can join the group.</p>
++        <div className="row">
++          <input readOnly value={link} aria-label="Invite link" onFocus={(event) => event.target.select()} />
++          <button type="button" onClick={copyLink}>{copied ? 'Copied' : 'Copy'}</button>
++          {isAdmin && <button type="button" className="secondary" onClick={rotateLink}>New link</button>}
++        </div>
++      </section>
++
++      <section className="card">
++        <h3>Members</h3>
++        <ul className="list">
++          {data.members.map((member) => (
++            <li key={member.user_id}>
++              <span>
++                {member.profile?.display_name || member.profile?.username || 'Member'}
++                {member.profile?.username && <span className="muted"> @{member.profile.username}</span>}
++              </span>
++              <span className="row">
++                <span className="muted">{member.role}</span>
++                {member.user_id === userId && (
++                  <button type="button" className="link" onClick={() => removeMember(userId)}>Leave</button>
++                )}
++                {isAdmin && member.user_id !== userId && (
++                  <button type="button" className="link" onClick={() => removeMember(member.user_id)}>Remove</button>
++                )}
++              </span>
++            </li>
++          ))}
++        </ul>
++        {isAdmin && <button type="button" className="danger" onClick={deleteGroup}>Delete group</button>}
++      </section>
++
++      {/* Bingrui: poll screens for this group go here (task 6). */}
++      {error && <p className="error" role="alert">{error}</p>}
++    </>
++  );
++}
+diff --git a/client/src/api.js b/client/src/api.js
+new file mode 100644
+index 0000000..fc53e73
+--- /dev/null
++++ b/client/src/api.js
+@@ -0,0 +1,33 @@
++import { supabase } from './supabase.js';
++
++// Call the Express API as the signed-in user. The access token comes from
++// supabase.auth.getSession(), which returns a refreshed token when the old one is
++// about to expire, and is sent as `Authorization: Bearer <token>` for Express to verify.
++export async function api(path, { method = 'GET', body } = {}) {
++  const { data } = await supabase.auth.getSession();
++  const token = data.session?.access_token;
++
++  const headers = {};
++  if (token) headers.Authorization = `Bearer ${token}`;
++  if (body !== undefined) headers['Content-Type'] = 'application/json';
++
++  const response = await fetch(`/api${path}`, {
++    method,
++    headers,
++    body: body === undefined ? undefined : JSON.stringify(body),
++  });
++
++  if (response.status === 204) return null;
++  const payload = await response.json().catch(() => ({}));
++
++  if (response.status === 401) {
++    // The token was rejected (for example, the user was deleted): drop the local session.
++    await supabase.auth.signOut({ scope: 'local' });
++  }
++  if (!response.ok) {
++    const error = new Error(payload.error ?? `Request failed (${response.status}).`);
++    error.status = response.status;
++    throw error;
++  }
++  return payload;
++}
+diff --git a/client/src/main.jsx b/client/src/main.jsx
+index 9584803..aa81e59 100644
+--- a/client/src/main.jsx
++++ b/client/src/main.jsx
+@@ -1,44 +1,132 @@
+-import { StrictMode, useEffect, useState } from 'react';
++import { StrictMode, useEffect, useRef, useState } from 'react';
+ import { createRoot } from 'react-dom/client';
++import { api } from './api.js';
++import { AuthScreen, NewPasswordScreen } from './AuthScreen.jsx';
++import { GroupPage, GroupsPage } from './Groups.jsx';
++import { navigate, usePath } from './router.js';
++import { SessionProvider, useSession } from './session.jsx';
++import { isSupabaseConfigured, supabase } from './supabase.js';
++import './styles.css';
+ 
+-function App() {
+-  const [status, setStatus] = useState('Checking connections…');
++const PENDING_INVITE = 'pendingInvite';
++
++function readPendingInvite() {
++  try {
++    return localStorage.getItem(PENDING_INVITE);
++  } catch {
++    return null;
++  }
++}
++
++function writePendingInvite(code) {
++  try {
++    if (code) localStorage.setItem(PENDING_INVITE, code);
++    else localStorage.removeItem(PENDING_INVITE);
++  } catch {
++    // Storage unavailable: the invite still works while this page stays open.
++  }
++}
++
++// Remember an invite from /join/<code> until the user is signed in, then accept it.
++// localStorage (not sessionStorage) so it survives the email confirmation round trip.
++function useInvite(path, session) {
++  const [pending, setPending] = useState(readPendingInvite);
++  const [error, setError] = useState('');
++  const joining = useRef(false);
++
++  useEffect(() => {
++    const code = /^\/join\/([0-9a-f]{32})$/i.exec(path)?.[1];
++    if (code) {
++      writePendingInvite(code);
++      setPending(code);
++    }
++  }, [path]);
++
++  useEffect(() => {
++    if (!session || !pending || joining.current) return;
++    joining.current = true;
++    api('/groups/join', { method: 'POST', body: { code: pending } })
++      .then((group) => navigate(`/groups/${group.id}`, { replace: true }))
++      .catch((caught) => {
++        setError(caught.message);
++        navigate('/', { replace: true });
++      })
++      .finally(() => {
++        writePendingInvite(null);
++        setPending(null);
++        joining.current = false;
++      });
++  }, [session, pending]);
++
++  return { pending, error };
++}
++
++function Header({ session }) {
++  const [profile, setProfile] = useState(null);
+ 
+   useEffect(() => {
+-    const controller = new AbortController();
+-
+-    async function checkApi() {
+-      try {
+-        const response = await fetch('/api/health', { signal: controller.signal });
+-        const data = response.ok ? await response.json() : null;
+-        if (data?.status !== 'ok') {
+-          setStatus('API unavailable');
+-        } else if (data.supabase === 'connected') {
+-          setStatus('API and Supabase connected');
+-        } else if (data.supabase === 'unavailable') {
+-          setStatus('API connected; Supabase unavailable');
+-        } else {
+-          setStatus('API connected; add Supabase credentials');
+-        }
+-      } catch {
+-        if (!controller.signal.aborted) setStatus('API unavailable');
+-      }
++    if (!session) {
++      setProfile(null);
++      return;
+     }
++    api('/me').then(setProfile).catch(() => setProfile(null));
++  }, [session?.user.id]);
++
++  return (
++    <header>
++      <h1><a href="/" onClick={(event) => { event.preventDefault(); navigate('/'); }}>Where Are We Eating?</a></h1>
++      {session && (
++        <div className="row">
++          <span className="muted">{profile?.display_name || profile?.username || session.user.email}</span>
++          <button type="button" className="secondary" onClick={() => supabase.auth.signOut()}>Sign out</button>
++        </div>
++      )}
++    </header>
++  );
++}
++
++function App() {
++  const path = usePath();
++  const { loading, session, recovering, finishRecovery } = useSession();
++  const invite = useInvite(path, session);
+ 
+-    checkApi();
+-    return () => controller.abort();
+-  }, []);
++  let content;
++  if (!isSupabaseConfigured) {
++    content = (
++      <section className="card">
++        <p>Add <code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_PUBLISHABLE_KEY</code> to <code>client/.env</code>, then restart <code>npm run dev</code>.</p>
++      </section>
++    );
++  } else if (loading) {
++    content = <p className="muted">Loading…</p>;
++  } else if (recovering || (session && path === '/reset-password')) {
++    content = <NewPasswordScreen onDone={() => { finishRecovery(); navigate('/', { replace: true }); }} />;
++  } else if (!session) {
++    content = <AuthScreen invitePending={Boolean(invite.pending)} />;
++  } else if (invite.pending) {
++    content = <p className="muted">Joining group…</p>;
++  } else {
++    const groupId = /^\/groups\/([^/]+)$/.exec(path)?.[1];
++    content = (
++      <>
++        {invite.error && <p className="error" role="alert">{invite.error}</p>}
++        {groupId ? <GroupPage key={groupId} groupId={groupId} userId={session.user.id} /> : <GroupsPage />}
++      </>
++    );
++  }
+ 
+   return (
+-    <main>
+-      <h1>Where Are We Eating?</h1>
+-      <p role="status">{status}</p>
+-    </main>
++    <>
++      <Header session={session} />
++      <main>{content}</main>
++    </>
+   );
+ }
+ 
+ createRoot(document.getElementById('root')).render(
+   <StrictMode>
+-    <App />
++    <SessionProvider>
++      <App />
++    </SessionProvider>
+   </StrictMode>,
+ );
+diff --git a/client/src/router.js b/client/src/router.js
+new file mode 100644
+index 0000000..623f31b
+--- /dev/null
++++ b/client/src/router.js
+@@ -0,0 +1,22 @@
++import { useEffect, useState } from 'react';
++
++// Minimal client-side routing: /, /groups/<id>, /join/<code>, /reset-password.
++export function navigate(path, { replace = false } = {}) {
++  if (path === window.location.pathname) return;
++  window.history[replace ? 'replaceState' : 'pushState'](null, '', path);
++  window.dispatchEvent(new PopStateEvent('popstate'));
++}
++
++export function usePath() {
++  const [path, setPath] = useState(window.location.pathname);
++  useEffect(() => {
++    const update = () => setPath(window.location.pathname);
++    window.addEventListener('popstate', update);
++    return () => window.removeEventListener('popstate', update);
++  }, []);
++  return path;
++}
++
++export function inviteLink(code) {
++  return `${window.location.origin}/join/${code}`;
++}
+diff --git a/client/src/session.jsx b/client/src/session.jsx
+new file mode 100644
+index 0000000..9378679
+--- /dev/null
++++ b/client/src/session.jsx
+@@ -0,0 +1,43 @@
++import { createContext, useContext, useEffect, useState } from 'react';
++import { supabase } from './supabase.js';
++
++const SessionContext = createContext(null);
++
++// Tracks the Supabase Auth session for the whole app.
++// onAuthStateChange fires INITIAL_SESSION on load (restoring a saved session), then
++// SIGNED_IN, SIGNED_OUT, TOKEN_REFRESHED, USER_UPDATED and PASSWORD_RECOVERY.
++export function SessionProvider({ children }) {
++  const [state, setState] = useState({ loading: true, session: null, recovering: false });
++
++  useEffect(() => {
++    if (!supabase) {
++      setState({ loading: false, session: null, recovering: false });
++      return undefined;
++    }
++
++    const { data } = supabase.auth.onAuthStateChange((event, session) => {
++      // Keep this callback synchronous: Supabase warns against awaiting other
++      // supabase calls inside it.
++      setState((previous) => ({
++        loading: false,
++        session,
++        recovering: event === 'PASSWORD_RECOVERY'
++          ? true
++          : event === 'SIGNED_OUT' ? false : previous.recovering,
++      }));
++    });
++    return () => data.subscription.unsubscribe();
++  }, []);
++
++  const finishRecovery = () => setState((previous) => ({ ...previous, recovering: false }));
++
++  return (
++    <SessionContext.Provider value={{ ...state, finishRecovery }}>
++      {children}
++    </SessionContext.Provider>
++  );
++}
++
++export function useSession() {
++  return useContext(SessionContext);
++}
+diff --git a/client/src/styles.css b/client/src/styles.css
+new file mode 100644
+index 0000000..c0a5e1e
+--- /dev/null
++++ b/client/src/styles.css
+@@ -0,0 +1,115 @@
++:root {
++  --bg: #f6f4f1;
++  --surface: #ffffff;
++  --text: #1f1d1a;
++  --muted: #6b665f;
++  --border: #e2ddd5;
++  --accent: #c2410c;
++  --accent-text: #ffffff;
++  --danger: #b91c1c;
++  --notice-bg: #ecfdf5;
++  --notice-text: #065f46;
++  color-scheme: light;
++}
++
++@media (prefers-color-scheme: dark) {
++  :root {
++    --bg: #171614;
++    --surface: #211f1c;
++    --text: #f1eee9;
++    --muted: #a39d94;
++    --border: #36322d;
++    --accent: #fb923c;
++    --accent-text: #1b1208;
++    --danger: #f87171;
++    --notice-bg: #0f2a22;
++    --notice-text: #a7f3d0;
++    color-scheme: dark;
++  }
++}
++
++* { box-sizing: border-box; }
++
++body {
++  margin: 0;
++  background: var(--bg);
++  color: var(--text);
++  font: 16px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif;
++}
++
++header, main {
++  max-width: 760px;
++  margin: 0 auto;
++  padding: 16px;
++}
++
++header {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 12px;
++  align-items: center;
++  justify-content: space-between;
++}
++
++header h1 { font-size: 1.25rem; margin: 0; }
++header h1 a { color: inherit; text-decoration: none; }
++h2 { margin-top: 0; }
++h3 { margin-bottom: 8px; }
++.card > h3:first-child { margin-top: 0; }
++
++.card {
++  background: var(--surface);
++  border: 1px solid var(--border);
++  border-radius: 12px;
++  padding: 20px;
++  margin-bottom: 16px;
++}
++
++.narrow { max-width: 420px; margin-inline: auto; }
++.stack { display: grid; gap: 12px; }
++.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
++.row input { flex: 1 1 220px; }
++.columns { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
++.columns .card { margin-bottom: 0; }
++.muted { color: var(--muted); }
++.error { color: var(--danger); margin: 8px 0; }
++.notice { background: var(--notice-bg); color: var(--notice-text); padding: 8px 12px; border-radius: 8px; }
++.links { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 0; }
++
++.list { list-style: none; padding: 0; margin: 0; }
++.list li {
++  display: flex;
++  justify-content: space-between;
++  gap: 12px;
++  flex-wrap: wrap;
++  padding: 10px 0;
++  border-bottom: 1px solid var(--border);
++}
++.list li:last-child { border-bottom: 0; }
++.list a { color: var(--accent); font-weight: 600; }
++
++label { display: grid; gap: 4px; font-weight: 500; }
++
++input {
++  font: inherit;
++  padding: 8px 10px;
++  border: 1px solid var(--border);
++  border-radius: 8px;
++  background: var(--bg);
++  color: var(--text);
++  min-width: 0;
++}
++
++button {
++  font: inherit;
++  padding: 8px 14px;
++  border-radius: 8px;
++  border: 1px solid var(--accent);
++  background: var(--accent);
++  color: var(--accent-text);
++  cursor: pointer;
++}
++button:disabled { opacity: 0.6; cursor: default; }
++button.secondary { background: transparent; color: var(--text); border-color: var(--border); }
++button.danger { background: transparent; color: var(--danger); border-color: var(--danger); margin-top: 12px; }
++button.link { background: none; border: 0; padding: 0; color: var(--accent); text-decoration: underline; }
+diff --git a/client/src/supabase.js b/client/src/supabase.js
+new file mode 100644
+index 0000000..bd8090e
+--- /dev/null
++++ b/client/src/supabase.js
+@@ -0,0 +1,15 @@
++import { createClient } from '@supabase/supabase-js';
++
++const url = import.meta.env.VITE_SUPABASE_URL;
++const key = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
++
++export const isSupabaseConfigured = Boolean(url && key && !key.startsWith('replace-with-'));
++
++// One client for the whole app. Supabase Auth keeps the session in localStorage,
++// refreshes the access token before it expires, and reads the session from
++// email links (sign-up confirmation, password reset) when the page loads.
++export const supabase = isSupabaseConfigured
++  ? createClient(url, key, {
++      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
++    })
++  : null;
+diff --git a/package-lock.json b/package-lock.json
+index 7670dc1..b02bbfc 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -13,6 +13,7 @@
+       ],
+       "devDependencies": {
+         "concurrently": "^9.2.0",
++        "pg": "^8.23.1",
+         "supabase": "^2.54.0"
+       },
+       "engines": {
+@@ -2568,6 +2569,103 @@
+         "url": "https://opencollective.com/express"
+       }
+     },
++    "node_modules/pg": {
++      "version": "8.23.1",
++      "resolved": "https://registry.npmjs.org/pg/-/pg-8.23.1.tgz",
++      "integrity": "sha512-aL96AHANtWjPLDOLqnhx+ngp9+UK7ETEU8VJrDCGvsSSi/mGLcWYsS6Herg7lmaBJe4uwrfqsa7gTEFaSizDoQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "pg-connection-string": "^2.14.1",
++        "pg-pool": "^3.14.0",
++        "pg-protocol": "^1.16.1",
++        "pg-types": "2.2.0",
++        "pgpass": "1.0.5"
++      },
++      "engines": {
++        "node": ">= 16.0.0"
++      },
++      "optionalDependencies": {
++        "pg-cloudflare": "^1.4.1"
++      },
++      "peerDependencies": {
++        "pg-native": ">=3.0.1"
++      },
++      "peerDependenciesMeta": {
++        "pg-native": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/pg-cloudflare": {
++      "version": "1.4.1",
++      "resolved": "https://registry.npmjs.org/pg-cloudflare/-/pg-cloudflare-1.4.1.tgz",
++      "integrity": "sha512-6PQbsFWZcp9EmJEwy5cGQ2La+AMWpP46lgbb8X+U/XsHIUweYDNCpeuKck5RxL2MdVFi7krbbEi5nX4Zh7JhrQ==",
++      "dev": true,
++      "license": "MIT",
++      "optional": true
++    },
++    "node_modules/pg-connection-string": {
++      "version": "2.14.1",
++      "resolved": "https://registry.npmjs.org/pg-connection-string/-/pg-connection-string-2.14.1.tgz",
++      "integrity": "sha512-qR3kGNPBLpCNtz0evbKA0Y/MRFXwSSdT+pTJvYp/bXTcReZbvX1kzF0IyTc1QnxqF7AZbOeBhNL8R5mYQZV/MA==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/pg-int8": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/pg-int8/-/pg-int8-1.0.1.tgz",
++      "integrity": "sha512-WCtabS6t3c8SkpDBUlb1kjOs7l66xsGdKpIPZsg4wR+B3+u9UAum2odSsF9tnvxg80h4ZxLWMy4pRjOsFIqQpw==",
++      "dev": true,
++      "license": "ISC",
++      "engines": {
++        "node": ">=4.0.0"
++      }
++    },
++    "node_modules/pg-pool": {
++      "version": "3.14.0",
++      "resolved": "https://registry.npmjs.org/pg-pool/-/pg-pool-3.14.0.tgz",
++      "integrity": "sha512-gKtPkFdQPU3DksooVLi9LsjZxrsBUZIpa+7aVx+LV5pNh0KzP4Zleud2po+ConrxbuXGBJ6Hfer6hdgpIBpBaw==",
++      "dev": true,
++      "license": "MIT",
++      "peerDependencies": {
++        "pg": ">=8.0"
++      }
++    },
++    "node_modules/pg-protocol": {
++      "version": "1.16.1",
++      "resolved": "https://registry.npmjs.org/pg-protocol/-/pg-protocol-1.16.1.tgz",
++      "integrity": "sha512-p9VOFMiHB/ZbJATetbg+99PxssTVSQRnyuPSQ67mN1+1KBOjZaZ83ZQzltnxPhJwSsC3nwVjJ10DVJlerbFzLg==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/pg-types": {
++      "version": "2.2.0",
++      "resolved": "https://registry.npmjs.org/pg-types/-/pg-types-2.2.0.tgz",
++      "integrity": "sha512-qTAAlrEsl8s4OiEQY69wDvcMIdQN6wdz5ojQiOy6YRMuynxenON0O5oCpJI6lshc6scgAY8qvJ2On/p+CXY0GA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "pg-int8": "1.0.1",
++        "postgres-array": "~2.0.0",
++        "postgres-bytea": "~1.0.0",
++        "postgres-date": "~1.0.4",
++        "postgres-interval": "^1.1.0"
++      },
++      "engines": {
++        "node": ">=4"
++      }
++    },
++    "node_modules/pgpass": {
++      "version": "1.0.5",
++      "resolved": "https://registry.npmjs.org/pgpass/-/pgpass-1.0.5.tgz",
++      "integrity": "sha512-FdW9r/jQZhSeohs1Z3sI1yxFQNFvMcnmfuj4WBMUTxOrAyLMaTcE1aAMBiTlbMNaXvBCQuVi0R7hd8udDSP7ug==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "split2": "^4.1.0"
++      }
++    },
+     "node_modules/picocolors": {
+       "version": "1.1.1",
+       "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
+@@ -2617,6 +2715,49 @@
+         "node": "^10 || ^12 || >=14"
+       }
+     },
++    "node_modules/postgres-array": {
++      "version": "2.0.0",
++      "resolved": "https://registry.npmjs.org/postgres-array/-/postgres-array-2.0.0.tgz",
++      "integrity": "sha512-VpZrUqU5A69eQyW2c5CA1jtLecCsN2U/bD6VilrFDWq5+5UIEVO7nazS3TEcHf1zuPYO/sqGvUvW62g86RXZuA==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=4"
++      }
++    },
++    "node_modules/postgres-bytea": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/postgres-bytea/-/postgres-bytea-1.0.1.tgz",
++      "integrity": "sha512-5+5HqXnsZPE65IJZSMkZtURARZelel2oXUEO8rH83VS/hxH5vv1uHquPg5wZs8yMAfdv971IU+kcPUczi7NVBQ==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/postgres-date": {
++      "version": "1.0.7",
++      "resolved": "https://registry.npmjs.org/postgres-date/-/postgres-date-1.0.7.tgz",
++      "integrity": "sha512-suDmjLVQg78nMK2UZ454hAG+OAW+HQPZ6n++TNDUX+L0+uUlLywnoxJKDou51Zm+zTCjrCl0Nq6J9C5hP9vK/Q==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/postgres-interval": {
++      "version": "1.2.0",
++      "resolved": "https://registry.npmjs.org/postgres-interval/-/postgres-interval-1.2.0.tgz",
++      "integrity": "sha512-9ZhXKM/rw350N1ovuWHbGxnGh/SNJ4cnxHiM0rxE4VN41wsg8P8zWn9hv/buK00RP4WvlOyr/RBDiptyxVbkZQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "xtend": "^4.0.0"
++      },
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
+     "node_modules/proxy-addr": {
+       "version": "2.0.8",
+       "resolved": "https://registry.npmjs.org/proxy-addr/-/proxy-addr-2.0.8.tgz",
+@@ -2959,6 +3100,16 @@
+         "node": ">=0.10.0"
+       }
+     },
++    "node_modules/split2": {
++      "version": "4.2.0",
++      "resolved": "https://registry.npmjs.org/split2/-/split2-4.2.0.tgz",
++      "integrity": "sha512-UcjcJOWknrNkF6PLX83qcHM6KHgVKNkV62Y8a5uYDVv9ydGQVwAHMKqHdJje1VTWpljG0WYpCDhrCdAOYH4TWg==",
++      "dev": true,
++      "license": "ISC",
++      "engines": {
++        "node": ">= 10.x"
++      }
++    },
+     "node_modules/statuses": {
+       "version": "2.0.2",
+       "resolved": "https://registry.npmjs.org/statuses/-/statuses-2.0.2.tgz",
+@@ -3245,6 +3396,16 @@
+       "integrity": "sha512-l4Sp/DRseor9wL6EvV2+TuQn63dMkPjZ/sp9XkghTEbV9KlPS1xUsZ3u7/IQO4wxtcFB4bgpQPRcR3QCvezPcQ==",
+       "license": "ISC"
+     },
++    "node_modules/xtend": {
++      "version": "4.0.2",
++      "resolved": "https://registry.npmjs.org/xtend/-/xtend-4.0.2.tgz",
++      "integrity": "sha512-LKYU1iAXJXUgAXn9URjiu+MWhyUXHsvfp7mcuYm9dSUKK0/CjtrUwFAxD82/mCWbtLsGjFIad0wIsod4zrTAEQ==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=0.4"
++      }
++    },
+     "node_modules/y18n": {
+       "version": "5.0.8",
+       "resolved": "https://registry.npmjs.org/y18n/-/y18n-5.0.8.tgz",
+diff --git a/package.json b/package.json
+index 12dc9d1..c536f6e 100644
+--- a/package.json
++++ b/package.json
+@@ -16,10 +16,13 @@
+     "dev:web": "npm run dev --workspace client",
+     "build": "npm run build --workspace client",
+     "start": "npm run start --workspace server",
+-    "db": "supabase"
++    "db": "supabase",
++    "test:rls": "node --env-file-if-exists=.env.test --test --test-reporter=spec \"tests/**/*.test.js\"",
++    "bench:rls": "node --env-file-if-exists=.env.test benchmarks/rls-cost.js"
+   },
+   "devDependencies": {
+     "concurrently": "^9.2.0",
++    "pg": "^8.23.1",
+     "supabase": "^2.54.0"
+   },
+   "allowScripts": {
+diff --git a/server/.env.example b/server/.env.example
+new file mode 100644
+index 0000000..8d5d0f1
+--- /dev/null
++++ b/server/.env.example
+@@ -0,0 +1,5 @@
++# Same project URL and publishable key as client/.env. Express verifies users' access
++# tokens with these and forwards each token to Supabase, so it never needs the secret key.
++SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
++SUPABASE_PUBLISHABLE_KEY=replace-with-your-publishable-key
++PORT=3000
+diff --git a/server/app.js b/server/app.js
+new file mode 100644
+index 0000000..685acb7
+--- /dev/null
++++ b/server/app.js
+@@ -0,0 +1,53 @@
++import express from 'express';
++import { fileURLToPath } from 'node:url';
++import { requireAuth } from './auth.js';
++import { groupsRouter } from './routes/groups.js';
++import { meRouter } from './routes/me.js';
++import { isSupabaseConfigured, supabaseKey, supabaseUrl } from './supabase.js';
++
++const clientDist = fileURLToPath(new URL('../client/dist/', import.meta.url));
++
++export function createApp() {
++  const app = express();
++  app.use(express.json({ limit: '16kb' }));
++
++  app.get('/api/health', async (_req, res) => {
++    let supabaseStatus = 'not_configured';
++
++    if (isSupabaseConfigured()) {
++      try {
++        const response = await fetch(`${supabaseUrl.replace(/\/$/, '')}/auth/v1/health`, {
++          headers: { apikey: supabaseKey },
++          signal: AbortSignal.timeout(5000),
++        });
++        supabaseStatus = response.ok ? 'connected' : 'unavailable';
++      } catch {
++        supabaseStatus = 'unavailable';
++      }
++    }
++
++    res.status(200).json({ status: 'ok', supabase: supabaseStatus });
++  });
++
++  // Everything below needs a signed-in user.
++  app.use('/api', requireAuth);
++  app.use('/api/me', meRouter);
++  app.use('/api/groups', groupsRouter);
++  app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found.' }));
++
++  // Production: serve the built React app, including client-side routes like /join/<code>.
++  app.use(express.static(clientDist));
++  app.get(/^(?!\/api\/).*/, (_req, res, next) => {
++    res.sendFile('index.html', { root: clientDist }, (error) => error && next());
++  });
++
++  app.use((error, _req, res, _next) => {
++    if (error.type === 'entity.parse.failed') {
++      return res.status(400).json({ error: 'Request body must be valid JSON.' });
++    }
++    console.error(error);
++    return res.status(500).json({ error: 'Something went wrong. Try again.' });
++  });
++
++  return app;
++}
+diff --git a/server/auth.js b/server/auth.js
+new file mode 100644
+index 0000000..07682d0
+--- /dev/null
++++ b/server/auth.js
+@@ -0,0 +1,37 @@
++import { createUserClient, getAuthClient, isSupabaseConfigured } from './supabase.js';
++
++// Express middleware: require a valid Supabase access token.
++//
++// The browser sends `Authorization: Bearer <access token>`. supabase.auth.getClaims()
++// checks the token's signature and expiry: with asymmetric signing keys it verifies
++// locally against the project's published keys (JWKS); with a legacy shared secret it
++// asks Supabase Auth. On success the request gets:
++//   req.user      { id, email, claims }
++//   req.supabase  a Supabase client that runs as this user, so RLS applies
++export async function requireAuth(req, res, next) {
++  if (!isSupabaseConfigured()) {
++    return res.status(503).json({ error: 'Supabase is not configured on the server.' });
++  }
++
++  const match = /^Bearer\s+(\S+)$/i.exec(req.get('authorization') ?? '');
++  if (!match) {
++    return res.status(401).json({ error: 'Sign in to continue.' });
++  }
++
++  const token = match[1];
++  let result;
++  try {
++    result = await getAuthClient().auth.getClaims(token);
++  } catch {
++    return res.status(401).json({ error: 'Your session is not valid. Sign in again.' });
++  }
++
++  const claims = result?.data?.claims;
++  if (result?.error || !claims?.sub || claims.role !== 'authenticated') {
++    return res.status(401).json({ error: 'Your session is not valid. Sign in again.' });
++  }
++
++  req.user = { id: claims.sub, email: claims.email, claims };
++  req.supabase = createUserClient(token);
++  return next();
++}
+diff --git a/server/errors.js b/server/errors.js
+new file mode 100644
+index 0000000..e7ed097
+--- /dev/null
++++ b/server/errors.js
+@@ -0,0 +1,35 @@
++// Turn a Supabase (PostgREST / Postgres) error into an HTTP status and a message
++// that is safe to show to the user.
++const statusByCode = {
++  '42501': 403, // insufficient privilege, including "new row violates row-level security policy"
++  P0002: 404, // raised by join_group() for an unknown invite code
++  PGRST116: 404, // .single() found no row, e.g. because RLS hides it
++  '23505': 409, // unique violation, e.g. username taken
++  '23503': 409, // foreign key violation
++  '23514': 400, // check constraint
++  '22P02': 400, // invalid input syntax, e.g. a malformed uuid
++};
++
++function messageFor(error, status) {
++  switch (error?.code) {
++    case '42501':
++      // Messages we raise ourselves are written for users; Postgres' own are not.
++      return error.message?.includes('row-level security') || error.message?.includes('permission denied')
++        ? 'You are not allowed to do that.'
++        : error.message;
++    case 'P0002':
++      return error.message;
++    case 'PGRST116':
++      return 'Not found.';
++    case '23505':
++      return 'That value is already taken.';
++    default:
++      return status === 400 ? 'Check the values you entered.' : 'Something went wrong. Try again.';
++  }
++}
++
++export function sendSupabaseError(res, error) {
++  const status = statusByCode[error?.code] ?? 500;
++  if (status === 500) console.error('Supabase error:', error);
++  return res.status(status).json({ error: messageFor(error, status), code: error?.code });
++}
+diff --git a/server/index.js b/server/index.js
+index c02f7be..2106828 100644
+--- a/server/index.js
++++ b/server/index.js
+@@ -1,32 +1,7 @@
+-import express from 'express';
+-import { fileURLToPath } from 'node:url';
++import { createApp } from './app.js';
+ 
+-const app = express();
+ const port = Number(process.env.PORT ?? 3000);
+-const clientDist = fileURLToPath(new URL('../client/dist/', import.meta.url));
+-const supabaseUrl = process.env.SUPABASE_URL;
+-const supabaseKey = process.env.SUPABASE_PUBLISHABLE_KEY;
+ 
+-app.get('/api/health', async (_req, res) => {
+-  let supabaseStatus = 'not_configured';
+-
+-  if (supabaseUrl && supabaseKey && !supabaseKey.startsWith('replace-with-')) {
+-    try {
+-      const response = await fetch(`${supabaseUrl.replace(/\/$/, '')}/auth/v1/health`, {
+-        headers: { apikey: supabaseKey },
+-        signal: AbortSignal.timeout(5000),
+-      });
+-      supabaseStatus = response.ok ? 'connected' : 'unavailable';
+-    } catch {
+-      supabaseStatus = 'unavailable';
+-    }
+-  }
+-
+-  res.status(200).json({ status: 'ok', supabase: supabaseStatus });
+-});
+-
+-app.use(express.static(clientDist));
+-
+-app.listen(port, () => {
++createApp().listen(port, () => {
+   console.log(`Express listening on port ${port}`);
+ });
+diff --git a/server/routes/groups.js b/server/routes/groups.js
+new file mode 100644
+index 0000000..31a59aa
+--- /dev/null
++++ b/server/routes/groups.js
+@@ -0,0 +1,133 @@
++import { Router } from 'express';
++import { sendSupabaseError } from '../errors.js';
++
++// Every query here runs as the signed-in user (req.supabase), so row level security
++// decides what is visible. These routes never filter by membership themselves: a group
++// you do not belong to is simply not returned by Supabase.
++export const groupsRouter = Router();
++
++const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
++const invitePattern = /[0-9a-f]{32}/i;
++
++function readName(body) {
++  const name = String(body?.name ?? '').trim();
++  return name.length >= 1 && name.length <= 80 ? name : null;
++}
++
++groupsRouter.param('groupId', (req, res, next, groupId) => {
++  if (!uuidPattern.test(groupId)) return res.status(404).json({ error: 'Group not found.' });
++  return next();
++});
++
++// Groups I belong to, with my role and the member count.
++groupsRouter.get('/', async (req, res) => {
++  const { data, error } = await req.supabase
++    .from('group_members')
++    .select('role, joined_at, group:groups(id, name, invite_code, created_at, members:group_members(count))')
++    .eq('user_id', req.user.id)
++    .order('joined_at', { ascending: false });
++  if (error) return sendSupabaseError(res, error);
++
++  return res.json(data.map(({ role, joined_at, group }) => ({
++    id: group.id,
++    name: group.name,
++    invite_code: group.invite_code,
++    created_at: group.created_at,
++    member_count: group.members?.[0]?.count ?? 0,
++    my_role: role,
++    joined_at,
++  })));
++});
++
++// Create a group. created_by defaults to auth.uid() and a trigger makes me its admin.
++groupsRouter.post('/', async (req, res) => {
++  const name = readName(req.body);
++  if (!name) return res.status(400).json({ error: 'Enter a group name up to 80 characters.' });
++
++  const { data, error } = await req.supabase
++    .from('groups')
++    .insert({ name })
++    .select('id, name, invite_code, created_at')
++    .single();
++  if (error) return sendSupabaseError(res, error);
++  return res.status(201).json({ ...data, my_role: 'admin', member_count: 1 });
++});
++
++// Join with an invite code or a full invite link.
++groupsRouter.post('/join', async (req, res) => {
++  const code = invitePattern.exec(String(req.body?.code ?? ''))?.[0];
++  if (!code) return res.status(400).json({ error: 'Paste an invite link or code.' });
++
++  const { data: groupId, error } = await req.supabase.rpc('join_group', { p_invite_code: code });
++  if (error) return sendSupabaseError(res, error);
++  return res.json({ id: groupId });
++});
++
++// One group with its members. Returns 404 for groups I am not in, because RLS hides them.
++groupsRouter.get('/:groupId', async (req, res) => {
++  const { data, error } = await req.supabase
++    .from('groups')
++    .select(`id, name, invite_code, created_by, created_at,
++      members:group_members(user_id, role, joined_at, profile:profiles(username, display_name))`)
++    .eq('id', req.params.groupId)
++    .maybeSingle();
++  if (error) return sendSupabaseError(res, error);
++  if (!data) return res.status(404).json({ error: 'Group not found.' });
++
++  const me = data.members.find((member) => member.user_id === req.user.id);
++  if (!me) return res.status(404).json({ error: 'Group not found.' });
++  data.members.sort((a, b) => a.joined_at.localeCompare(b.joined_at));
++  return res.json({ ...data, my_role: me.role });
++});
++
++// Rename (admins only; RLS turns anyone else's update into "no rows changed").
++groupsRouter.patch('/:groupId', async (req, res) => {
++  const name = readName(req.body);
++  if (!name) return res.status(400).json({ error: 'Enter a group name up to 80 characters.' });
++
++  const { data, error } = await req.supabase
++    .from('groups')
++    .update({ name })
++    .eq('id', req.params.groupId)
++    .select('id, name');
++  if (error) return sendSupabaseError(res, error);
++  if (data.length === 0) return res.status(403).json({ error: 'Only a group admin can rename the group.' });
++  return res.json(data[0]);
++});
++
++// Delete the group and everything in it (admins only).
++groupsRouter.delete('/:groupId', async (req, res) => {
++  const { data, error } = await req.supabase
++    .from('groups')
++    .delete()
++    .eq('id', req.params.groupId)
++    .select('id');
++  if (error) return sendSupabaseError(res, error);
++  if (data.length === 0) return res.status(403).json({ error: 'Only a group admin can delete the group.' });
++  return res.status(204).end();
++});
++
++// New invite code; old links stop working (admins only).
++groupsRouter.post('/:groupId/invite', async (req, res) => {
++  const { data, error } = await req.supabase.rpc('rotate_group_invite', {
++    p_group_id: req.params.groupId,
++  });
++  if (error) return sendSupabaseError(res, error);
++  return res.json({ invite_code: data });
++});
++
++// Leave the group (userId "me") or, as an admin, remove someone.
++groupsRouter.delete('/:groupId/members/:userId', async (req, res) => {
++  const userId = req.params.userId === 'me' ? req.user.id : req.params.userId;
++  if (!uuidPattern.test(userId)) return res.status(404).json({ error: 'Member not found.' });
++
++  const { data, error } = await req.supabase
++    .from('group_members')
++    .delete()
++    .eq('group_id', req.params.groupId)
++    .eq('user_id', userId)
++    .select('user_id');
++  if (error) return sendSupabaseError(res, error);
++  if (data.length === 0) return res.status(403).json({ error: 'You cannot remove that member.' });
++  return res.status(204).end();
++});
+diff --git a/server/routes/me.js b/server/routes/me.js
+new file mode 100644
+index 0000000..c5a0a04
+--- /dev/null
++++ b/server/routes/me.js
+@@ -0,0 +1,39 @@
++import { Router } from 'express';
++import { sendSupabaseError } from '../errors.js';
++
++export const meRouter = Router();
++
++// The signed-in user's profile (created by the on_auth_user_created trigger).
++meRouter.get('/', async (req, res) => {
++  const { data, error } = await req.supabase
++    .from('profiles')
++    .select('id, username, display_name, created_at')
++    .eq('id', req.user.id)
++    .single();
++  if (error) return sendSupabaseError(res, error);
++  return res.json({ ...data, email: req.user.email });
++});
++
++meRouter.patch('/', async (req, res) => {
++  const changes = {};
++  for (const field of ['username', 'display_name']) {
++    if (req.body?.[field] === undefined) continue;
++    const value = String(req.body[field] ?? '').trim();
++    if (value.length > 60) {
++      return res.status(400).json({ error: `${field.replace('_', ' ')} must be 60 characters or fewer.` });
++    }
++    changes[field] = value || null;
++  }
++  if (Object.keys(changes).length === 0) {
++    return res.status(400).json({ error: 'Nothing to update.' });
++  }
++
++  const { data, error } = await req.supabase
++    .from('profiles')
++    .update(changes)
++    .eq('id', req.user.id)
++    .select('id, username, display_name, created_at')
++    .single();
++  if (error) return sendSupabaseError(res, error);
++  return res.json({ ...data, email: req.user.email });
++});
+diff --git a/server/supabase.js b/server/supabase.js
+new file mode 100644
+index 0000000..2350444
+--- /dev/null
++++ b/server/supabase.js
+@@ -0,0 +1,32 @@
++import { createClient } from '@supabase/supabase-js';
++
++export const supabaseUrl = process.env.SUPABASE_URL;
++export const supabaseKey = process.env.SUPABASE_PUBLISHABLE_KEY;
++
++export function isSupabaseConfigured() {
++  return Boolean(supabaseUrl && supabaseKey && !supabaseKey.startsWith('replace-with-'));
++}
++
++// Express never stores a session of its own; each request carries the user's token.
++const serverAuthOptions = {
++  persistSession: false,
++  autoRefreshToken: false,
++  detectSessionInUrl: false,
++};
++
++let authClient;
++
++// Client used only to verify access tokens with supabase.auth.getClaims().
++export function getAuthClient() {
++  authClient ??= createClient(supabaseUrl, supabaseKey, { auth: serverAuthOptions });
++  return authClient;
++}
++
++// Client that acts as the signed-in user: Supabase sees their token on every query,
++// so auth.uid() is their id and row level security applies to everything it does.
++export function createUserClient(accessToken) {
++  return createClient(supabaseUrl, supabaseKey, {
++    auth: serverAuthOptions,
++    global: { headers: { Authorization: `Bearer ${accessToken}` } },
++  });
++}
+diff --git a/supabase/config.toml b/supabase/config.toml
+index f05ba8b..a5f48f8 100644
+--- a/supabase/config.toml
++++ b/supabase/config.toml
+@@ -29,7 +29,7 @@ port = 54324
+ [auth]
+ enabled = true
+ site_url = "http://localhost:5173"
+-additional_redirect_urls = ["http://localhost:5173/", "http://127.0.0.1:5173/"]
++additional_redirect_urls = ["http://localhost:5173/**", "http://127.0.0.1:5173/**", "http://localhost:3000/**"]
+ enable_signup = true
+ 
+ [auth.email]
+diff --git a/supabase/migrations/20261114000000_core_schema.sql b/supabase/migrations/20261114000000_core_schema.sql
+new file mode 100644
+index 0000000..b486e39
+--- /dev/null
++++ b/supabase/migrations/20261114000000_core_schema.sql
+@@ -0,0 +1,96 @@
++-- Core schema (task 2, Devon). This file records the schema that was created in the
++-- hosted Supabase project, so that local Supabase and a clean clone can rebuild it.
++-- It was written from a catalog report of the hosted database on Nov 16. The hosted
++-- project already has these objects: mark this migration as applied there with
++--   npx supabase migration repair --status applied 20261114000000
++-- instead of running it again.
++
++create table public.profiles (
++  id uuid primary key references auth.users (id) on delete cascade,
++  username text unique,
++  display_name text,
++  created_at timestamptz not null default now()
++);
++
++create table public.groups (
++  id uuid primary key default gen_random_uuid(),
++  name text not null check (length(trim(name)) > 0),
++  created_by uuid not null references public.profiles (id) on delete restrict,
++  created_at timestamptz not null default now()
++);
++
++create table public.group_members (
++  group_id uuid not null references public.groups (id) on delete cascade,
++  user_id uuid not null references public.profiles (id) on delete cascade,
++  role text not null default 'member' check (role in ('admin', 'member')),
++  joined_at timestamptz not null default now(),
++  primary key (group_id, user_id)
++);
++
++create table public.polls (
++  id uuid primary key default gen_random_uuid(),
++  group_id uuid not null references public.groups (id) on delete cascade,
++  created_by uuid not null references public.profiles (id) on delete restrict,
++  question text not null check (length(trim(question)) > 0),
++  status text not null default 'open' check (status in ('open', 'closed')),
++  saved_outcome_option_id uuid,
++  created_at timestamptz not null default now()
++);
++
++create table public.options (
++  id uuid primary key default gen_random_uuid(),
++  poll_id uuid not null references public.polls (id) on delete cascade,
++  restaurant_name text not null check (length(trim(restaurant_name)) > 0),
++  price_range text,
++  food_category text,
++  created_at timestamptz not null default now(),
++  constraint options_poll_id_id_unique unique (poll_id, id)
++);
++
++-- The saved outcome must be an option of the same poll.
++alter table public.polls
++  add constraint polls_saved_outcome_belongs_to_poll_fk
++  foreign key (id, saved_outcome_option_id) references public.options (poll_id, id)
++  on delete set null (saved_outcome_option_id);
++
++create table public.votes (
++  id uuid primary key default gen_random_uuid(),
++  poll_id uuid not null,
++  option_id uuid not null,
++  user_id uuid not null references public.profiles (id) on delete cascade,
++  created_at timestamptz not null default now(),
++  constraint votes_one_per_user_per_poll unique (poll_id, user_id),
++  constraint votes_option_must_belong_to_poll_fk
++    foreign key (poll_id, option_id) references public.options (poll_id, id) on delete cascade
++);
++
++alter table public.profiles enable row level security;
++alter table public.groups enable row level security;
++alter table public.group_members enable row level security;
++alter table public.polls enable row level security;
++alter table public.options enable row level security;
++alter table public.votes enable row level security;
++
++-- Create a profile row whenever Supabase Auth creates a user. Sign-up passes
++-- username and display_name in options.data, which Auth stores in raw_user_meta_data.
++create function public.handle_new_user() returns trigger
++language plpgsql security definer set search_path = '' as $$
++begin
++  insert into public.profiles (id, username, display_name)
++  values (
++    new.id,
++    nullif(new.raw_user_meta_data ->> 'username', ''),
++    coalesce(
++      nullif(new.raw_user_meta_data ->> 'display_name', ''),
++      nullif(new.raw_user_meta_data ->> 'full_name', ''),
++      nullif(new.raw_user_meta_data ->> 'name', '')
++    )
++  )
++  on conflict (id) do nothing;
++  return new;
++end;
++$$;
++
++create trigger on_auth_user_created
++  after insert on auth.users
++  for each row execute function public.handle_new_user();
+diff --git a/supabase/migrations/20261116000000_groups_and_rls.sql b/supabase/migrations/20261116000000_groups_and_rls.sql
+new file mode 100644
+index 0000000..d90d968
+--- /dev/null
++++ b/supabase/migrations/20261116000000_groups_and_rls.sql
+@@ -0,0 +1,265 @@
++-- Groups, invitations and row level security (task 4, Albion).
++--
++-- Security model
++--   * The browser signs in with Supabase Auth and sends its access token to Express.
++--     Express forwards that token to Supabase, so every query runs as the `authenticated`
++--     role with auth.uid() set to the user. Nothing in the app uses the secret key.
++--   * Row level security decides which rows each user can see or change:
++--     a user only sees groups they belong to, and the polls, options, votes and
++--     profiles of those groups.
++--   * `anon` (no sign-in) gets no table privileges at all.
++--   * Joining a group requires its invite code and goes through join_group(), because
++--     a non-member cannot see the group row and therefore cannot insert themselves.
++
++-- ---------------------------------------------------------------------------
++-- Helper functions
++-- They live in a schema the Data API does not expose, so they cannot be called
++-- over HTTP. They are SECURITY DEFINER so that policies on group_members can ask
++-- "is this user a member?" without the policy recursing into itself.
++-- ---------------------------------------------------------------------------
++create schema if not exists private;
++revoke all on schema private from public;
++grant usage on schema private to authenticated;
++
++-- Groups the current user belongs to. Used as `group_id in (select private.my_group_ids())`
++-- so Postgres evaluates it once per query instead of once per row.
++create function private.my_group_ids() returns setof uuid
++language sql stable security definer set search_path = '' as $$
++  select group_id from public.group_members where user_id = (select auth.uid());
++$$;
++
++-- Everyone who shares at least one group with the current user (including themselves).
++create function private.my_peer_ids() returns setof uuid
++language sql stable security definer set search_path = '' as $$
++  select distinct peer.user_id
++  from public.group_members me
++  join public.group_members peer on peer.group_id = me.group_id
++  where me.user_id = (select auth.uid());
++$$;
++
++-- Polls in the current user's groups.
++create function private.my_poll_ids() returns setof uuid
++language sql stable security definer set search_path = '' as $$
++  select p.id
++  from public.polls p
++  join public.group_members m on m.group_id = p.group_id
++  where m.user_id = (select auth.uid());
++$$;
++
++create function private.is_group_admin(p_group_id uuid) returns boolean
++language sql stable security definer set search_path = '' as $$
++  select exists (
++    select 1 from public.group_members
++    where group_id = p_group_id and user_id = (select auth.uid()) and role = 'admin'
++  );
++$$;
++
++-- True when the poll is open and belongs to one of the current user's groups.
++create function private.is_open_poll_in_my_group(p_poll_id uuid) returns boolean
++language sql stable security definer set search_path = '' as $$
++  select exists (
++    select 1
++    from public.polls p
++    join public.group_members m on m.group_id = p.group_id
++    where p.id = p_poll_id and p.status = 'open' and m.user_id = (select auth.uid())
++  );
++$$;
++
++revoke all on all functions in schema private from public, anon;
++grant execute on all functions in schema private to authenticated;
++
++-- ---------------------------------------------------------------------------
++-- Invite codes and creator membership
++-- ---------------------------------------------------------------------------
++-- 32 random hex characters (122 random bits), so codes cannot be guessed.
++alter table public.groups
++  add column invite_code text not null unique
++    default replace(gen_random_uuid()::text, '-', '')
++    check (invite_code ~ '^[0-9a-f]{32}$');
++
++-- Let Postgres fill in the signed-in user, so clients never send their own id.
++alter table public.groups alter column created_by set default auth.uid();
++alter table public.polls alter column created_by set default auth.uid();
++alter table public.votes alter column user_id set default auth.uid();
++
++-- Whoever creates a group becomes its admin, in the same transaction.
++create function private.add_group_creator() returns trigger
++language plpgsql security definer set search_path = '' as $$
++begin
++  insert into public.group_members (group_id, user_id, role)
++  values (new.id, new.created_by, 'admin');
++  return new;
++end;
++$$;
++revoke all on function private.add_group_creator() from public, anon, authenticated;
++
++create trigger groups_add_creator
++  after insert on public.groups
++  for each row execute function private.add_group_creator();
++
++-- Join a group with its invite code. Returns the group id. Joining twice is harmless.
++create function public.join_group(p_invite_code text) returns uuid
++language plpgsql volatile security definer set search_path = '' as $$
++declare
++  v_user uuid := auth.uid();
++  v_group uuid;
++begin
++  if v_user is null then
++    raise exception 'Sign in to join a group.' using errcode = '42501';
++  end if;
++
++  select id into v_group
++  from public.groups
++  where invite_code = lower(trim(p_invite_code));
++
++  if v_group is null then
++    raise exception 'That invite link is not valid.' using errcode = 'P0002';
++  end if;
++
++  insert into public.group_members (group_id, user_id, role)
++  values (v_group, v_user, 'member')
++  on conflict (group_id, user_id) do nothing;
++
++  return v_group;
++end;
++$$;
++
++-- Replace a group's invite code so old links stop working. Admins only.
++create function public.rotate_group_invite(p_group_id uuid) returns text
++language plpgsql volatile security definer set search_path = '' as $$
++declare
++  v_code text;
++begin
++  if not private.is_group_admin(p_group_id) then
++    raise exception 'Only a group admin can change the invite link.' using errcode = '42501';
++  end if;
++
++  update public.groups
++  set invite_code = replace(gen_random_uuid()::text, '-', '')
++  where id = p_group_id
++  returning invite_code into v_code;
++
++  return v_code;
++end;
++$$;
++
++revoke all on function public.join_group(text), public.rotate_group_invite(uuid)
++  from public, anon;
++grant execute on function public.join_group(text), public.rotate_group_invite(uuid)
++  to authenticated;
++
++-- ---------------------------------------------------------------------------
++-- Table privileges. RLS filters rows; grants decide which commands and columns
++-- are possible at all. Both layers must allow an action.
++-- ---------------------------------------------------------------------------
++revoke all on public.profiles, public.groups, public.group_members,
++  public.polls, public.options, public.votes from anon, authenticated;
++
++grant select on public.profiles, public.groups, public.group_members,
++  public.polls, public.options, public.votes to authenticated;
++
++grant update (username, display_name) on public.profiles to authenticated;
++grant insert (name), update (name), delete on public.groups to authenticated;
++grant delete on public.group_members to authenticated;
++grant insert (group_id, question), delete on public.polls to authenticated;
++grant insert (poll_id, restaurant_name, price_range, food_category) on public.options
++  to authenticated;
++grant insert (poll_id, option_id), update (option_id), delete on public.votes to authenticated;
++
++-- ---------------------------------------------------------------------------
++-- Policies
++-- auth.uid() is wrapped in (select ...) so Postgres evaluates it once per query.
++-- ---------------------------------------------------------------------------
++
++-- profiles: see yourself and people in your groups; edit only yourself.
++-- Rows are created by the sign-up trigger and deleted with the auth user.
++create policy "profiles: read self and group peers" on public.profiles
++  for select to authenticated
++  using (id = (select auth.uid()) or id in (select private.my_peer_ids()));
++
++create policy "profiles: update self" on public.profiles
++  for update to authenticated
++  using (id = (select auth.uid()))
++  with check (id = (select auth.uid()));
++
++-- groups: members can read; anyone signed in can create one as themselves;
++-- admins can rename or delete. The creator may also read the row, because
++-- INSERT ... RETURNING checks the read policy before the trigger adds the admin row.
++create policy "groups: members read" on public.groups
++  for select to authenticated
++  using (id in (select private.my_group_ids()) or created_by = (select auth.uid()));
++
++create policy "groups: create as self" on public.groups
++  for insert to authenticated
++  with check (created_by = (select auth.uid()));
++
++create policy "groups: admins update" on public.groups
++  for update to authenticated
++  using (private.is_group_admin(id))
++  with check (private.is_group_admin(id));
++
++create policy "groups: admins delete" on public.groups
++  for delete to authenticated
++  using (private.is_group_admin(id));
++
++-- group_members: members see the roster. Rows are added only by the creator trigger
++-- and join_group(). You can leave a group, and admins can remove members.
++create policy "group_members: members read roster" on public.group_members
++  for select to authenticated
++  using (group_id in (select private.my_group_ids()));
++
++create policy "group_members: leave or admin removes" on public.group_members
++  for delete to authenticated
++  using (user_id = (select auth.uid()) or private.is_group_admin(group_id));
++
++-- polls: members read and create polls in their groups. The creator or an admin can
++-- delete. There is no UPDATE policy: closing a poll goes through the close-poll
++-- function (task 5), so status and outcome cannot be edited directly.
++create policy "polls: members read" on public.polls
++  for select to authenticated
++  using (group_id in (select private.my_group_ids()));
++
++create policy "polls: members create" on public.polls
++  for insert to authenticated
++  with check (
++    created_by = (select auth.uid())
++    and group_id in (select private.my_group_ids())
++  );
++
++create policy "polls: creator or admin deletes" on public.polls
++  for delete to authenticated
++  using (created_by = (select auth.uid()) or private.is_group_admin(group_id));
++
++-- options: members read; members suggest restaurants while the poll is open.
++create policy "options: members read" on public.options
++  for select to authenticated
++  using (poll_id in (select private.my_poll_ids()));
++
++create policy "options: members suggest while open" on public.options
++  for insert to authenticated
++  with check (private.is_open_poll_in_my_group(poll_id));
++
++-- votes: members read the votes in their groups' polls (Realtime uses this policy too).
++-- You can cast, change or remove only your own vote, and only while the poll is open.
++create policy "votes: members read" on public.votes
++  for select to authenticated
++  using (poll_id in (select private.my_poll_ids()));
++
++create policy "votes: cast own while open" on public.votes
++  for insert to authenticated
++  with check (user_id = (select auth.uid()) and private.is_open_poll_in_my_group(poll_id));
++
++create policy "votes: change own while open" on public.votes
++  for update to authenticated
++  using (user_id = (select auth.uid()) and private.is_open_poll_in_my_group(poll_id))
++  with check (user_id = (select auth.uid()) and private.is_open_poll_in_my_group(poll_id));
++
++create policy "votes: remove own while open" on public.votes
++  for delete to authenticated
++  using (user_id = (select auth.uid()) and private.is_open_poll_in_my_group(poll_id));
++
++-- ---------------------------------------------------------------------------
++-- Indexes the policies rely on (the primary key covers group_id-first lookups).
++-- ---------------------------------------------------------------------------
++create index if not exists group_members_user_id_idx on public.group_members (user_id, group_id);
++create index if not exists polls_group_id_idx on public.polls (group_id);
+diff --git a/tests/rls-attacks.test.js b/tests/rls-attacks.test.js
+new file mode 100644
+index 0000000..1c71a46
+--- /dev/null
++++ b/tests/rls-attacks.test.js
+@@ -0,0 +1,322 @@
++// "Attack" tests for task 4: call the Supabase Data API directly (not through Express)
++// as different users and prove that row level security and table grants block every
++// attempt to read or change another group's data.
++//
++// Needs SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY and SUPABASE_SECRET_KEY in .env.test.
++// The secret key is used only to create and delete the test users and to close a poll
++// as an administrator would; every attack runs with the publishable key and a user token.
++//
++//   npm run test:rls
++import assert from 'node:assert/strict';
++import { createHmac, randomUUID } from 'node:crypto';
++import { after, before, describe, test } from 'node:test';
++import { createClient } from '@supabase/supabase-js';
++
++const url = process.env.SUPABASE_URL;
++const publishableKey = process.env.SUPABASE_PUBLISHABLE_KEY;
++const secretKey = process.env.SUPABASE_SECRET_KEY;
++const configured = Boolean(url && publishableKey && secretKey);
++
++const noSession = { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } };
++const run = randomUUID().slice(0, 8);
++const password = `Test-${randomUUID()}`;
++
++const admin = configured ? createClient(url, secretKey, noSession) : null;
++const users = {};
++const createdGroups = [];
++let groupId;
++let inviteCode;
++let pollId;
++let optionId;
++let strangerGroupId;
++
++async function createUser(name) {
++  const email = `rls-${name}-${run}@example.com`;
++  const { data, error } = await admin.auth.admin.createUser({
++    email,
++    password,
++    email_confirm: true,
++    user_metadata: { username: `${name}_${run}`, display_name: name },
++  });
++  assert.ifError(error);
++
++  const client = createClient(url, publishableKey, noSession);
++  const { data: signIn, error: signInError } = await client.auth.signInWithPassword({ email, password });
++  assert.ifError(signInError);
++  return { id: data.user.id, client, token: signIn.session.access_token };
++}
++
++// A request was blocked either by a missing grant / RLS check (error 42501)
++// or because RLS hid every row, so nothing came back or changed.
++function assertBlocked({ data, error }) {
++  if (error) {
++    assert.equal(error.code, '42501', `expected 42501, got ${error.code}: ${error.message}`);
++  } else {
++    assert.deepEqual(data, [], 'expected no rows to be returned or changed');
++  }
++}
++
++function assertRlsViolation({ error }) {
++  assert.ok(error, 'expected the request to fail');
++  assert.equal(error.code, '42501', `expected 42501, got ${error.code}: ${error.message}`);
++}
++
++describe('row level security attacks', { skip: !configured && 'set SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY and SUPABASE_SECRET_KEY in .env.test' }, () => {
++  before(async () => {
++    users.alice = await createUser('alice');
++    users.bob = await createUser('bob');
++    users.mallory = await createUser('mallory');
++
++    // Alice creates a group, Bob joins it with the invite code.
++    const group = await users.alice.client.from('groups').insert({ name: `Alice's group ${run}` })
++      .select('id, invite_code').single();
++    assert.ifError(group.error);
++    groupId = group.data.id;
++    inviteCode = group.data.invite_code;
++    createdGroups.push(groupId);
++
++    const joined = await users.bob.client.rpc('join_group', { p_invite_code: inviteCode });
++    assert.ifError(joined.error);
++
++    const poll = await users.alice.client.from('polls').insert({ group_id: groupId, question: 'Where tonight?' })
++      .select('id').single();
++    assert.ifError(poll.error);
++    pollId = poll.data.id;
++
++    const option = await users.alice.client.from('options')
++      .insert({ poll_id: pollId, restaurant_name: 'Taco Place', price_range: '$', food_category: 'Mexican' })
++      .select('id').single();
++    assert.ifError(option.error);
++    optionId = option.data.id;
++
++    const vote = await users.alice.client.from('votes').insert({ poll_id: pollId, option_id: optionId });
++    assert.ifError(vote.error);
++
++    // Mallory has a group of her own, so she is a normal signed-in user.
++    const own = await users.mallory.client.from('groups').insert({ name: `Mallory's group ${run}` })
++      .select('id').single();
++    assert.ifError(own.error);
++    strangerGroupId = own.data.id;
++    createdGroups.push(strangerGroupId);
++  });
++
++  after(async () => {
++    if (!admin) return;
++    // groups.created_by and polls.created_by are ON DELETE RESTRICT: remove groups first.
++    if (createdGroups.length) await admin.from('groups').delete().in('id', createdGroups);
++    for (const user of Object.values(users)) await admin.auth.admin.deleteUser(user.id);
++  });
++
++  describe('members get what they should', () => {
++    test('the creator is the admin and the invited user is a member', async () => {
++      const { data, error } = await users.alice.client.from('group_members').select('user_id, role')
++        .eq('group_id', groupId).order('role');
++      assert.ifError(error);
++      assert.deepEqual(data.map((row) => row.role), ['admin', 'member']);
++    });
++
++    test('a member can read the poll, options, votes and other members\' profiles', async () => {
++      const { client } = users.bob;
++      assert.equal((await client.from('polls').select('id').eq('id', pollId)).data.length, 1);
++      assert.equal((await client.from('options').select('id').eq('poll_id', pollId)).data.length, 1);
++      assert.equal((await client.from('votes').select('id').eq('poll_id', pollId)).data.length, 1);
++      assert.equal((await client.from('profiles').select('id').eq('id', users.alice.id)).data.length, 1);
++    });
++
++    test('a member can vote and change their own vote', async () => {
++      const { client, id } = users.bob;
++      assert.ifError((await client.from('votes').insert({ poll_id: pollId, option_id: optionId })).error);
++      const changed = await client.from('votes').update({ option_id: optionId }).eq('poll_id', pollId)
++        .eq('user_id', id).select('id');
++      assert.ifError(changed.error);
++      assert.equal(changed.data.length, 1);
++    });
++  });
++
++  describe('signed-out requests (publishable key only)', () => {
++    const anon = configured ? createClient(url, publishableKey, noSession) : null;
++
++    for (const table of ['profiles', 'groups', 'group_members', 'polls', 'options', 'votes']) {
++      test(`cannot read ${table}`, async () => {
++        assertBlocked(await anon.from(table).select('*'));
++      });
++    }
++
++    test('cannot join a group, even with a valid invite code', async () => {
++      const { error } = await anon.rpc('join_group', { p_invite_code: inviteCode });
++      assert.ok(error);
++    });
++  });
++
++  describe('an outsider (Mallory) cannot read another group', () => {
++    test('groups: sees only her own group', async () => {
++      const { data, error } = await users.mallory.client.from('groups').select('id');
++      assert.ifError(error);
++      assert.deepEqual(data.map((row) => row.id), [strangerGroupId]);
++    });
++
++    test('groups: asking for the id directly returns nothing', async () => {
++      assertBlocked(await users.mallory.client.from('groups').select('*').eq('id', groupId));
++    });
++
++    test('group_members, polls, options and votes return nothing', async () => {
++      const { client } = users.mallory;
++      assertBlocked(await client.from('group_members').select('*').eq('group_id', groupId));
++      assertBlocked(await client.from('polls').select('*').eq('group_id', groupId));
++      assertBlocked(await client.from('options').select('*').eq('poll_id', pollId));
++      assertBlocked(await client.from('votes').select('*').eq('poll_id', pollId));
++    });
++
++    test('profiles: cannot see users she shares no group with', async () => {
++      assertBlocked(await users.mallory.client.from('profiles').select('*')
++        .in('id', [users.alice.id, users.bob.id]));
++    });
++
++    test('embedding through her own rows does not leak other groups', async () => {
++      const { data, error } = await users.mallory.client.from('group_members')
++        .select('group_id, groups(name, polls(question))');
++      assert.ifError(error);
++      assert.ok(data.every((row) => row.group_id === strangerGroupId));
++    });
++  });
++
++  describe('an outsider (Mallory) cannot change another group', () => {
++    test('cannot add herself to the group without the invite code', async () => {
++      assertRlsViolation(await users.mallory.client.from('group_members')
++        .insert({ group_id: groupId, user_id: users.mallory.id, role: 'admin' }));
++    });
++
++    test('cannot join with a guessed invite code', async () => {
++      const { error } = await users.mallory.client.rpc('join_group', { p_invite_code: '0'.repeat(32) });
++      assert.equal(error?.code, 'P0002');
++    });
++
++    test('cannot create a poll, suggest an option or vote', async () => {
++      const { client } = users.mallory;
++      assertRlsViolation(await client.from('polls').insert({ group_id: groupId, question: 'Hijacked?' }));
++      assertRlsViolation(await client.from('options').insert({ poll_id: pollId, restaurant_name: 'Spam Diner' }));
++      assertRlsViolation(await client.from('votes').insert({ poll_id: pollId, option_id: optionId }));
++    });
++
++    test('cannot rename or delete the group', async () => {
++      const { client } = users.mallory;
++      assertBlocked(await client.from('groups').update({ name: 'pwned' }).eq('id', groupId).select());
++      assertBlocked(await client.from('groups').delete().eq('id', groupId).select());
++      const check = await users.alice.client.from('groups').select('name').eq('id', groupId).single();
++      assert.equal(check.data.name, `Alice's group ${run}`);
++    });
++
++    test('cannot remove members, delete polls or delete votes', async () => {
++      const { client } = users.mallory;
++      assertBlocked(await client.from('group_members').delete().eq('group_id', groupId).select());
++      assertBlocked(await client.from('polls').delete().eq('id', pollId).select());
++      assertBlocked(await client.from('votes').delete().eq('poll_id', pollId).select());
++    });
++
++    test('cannot rotate the invite code', async () => {
++      const { error } = await users.mallory.client.rpc('rotate_group_invite', { p_group_id: groupId });
++      assert.equal(error?.code, '42501');
++    });
++
++    test('cannot create a group in someone else\'s name', async () => {
++      assertRlsViolation(await users.mallory.client.from('groups')
++        .insert({ name: 'Framed', created_by: users.alice.id }));
++    });
++
++    test('cannot call the private helper functions over the API', async () => {
++      const { error } = await users.mallory.client.rpc('my_group_ids');
++      assert.ok(error, 'private schema functions must not be reachable');
++    });
++  });
++
++  describe('a member (Bob) cannot go beyond his own rights', () => {
++    test('cannot vote as Alice or change Alice\'s vote', async () => {
++      const { client } = users.bob;
++      assertRlsViolation(await client.from('votes')
++        .insert({ poll_id: pollId, option_id: optionId, user_id: users.alice.id }));
++      assertBlocked(await client.from('votes').update({ option_id: optionId })
++        .eq('user_id', users.alice.id).select());
++      assertBlocked(await client.from('votes').delete().eq('user_id', users.alice.id).select());
++    });
++
++    test('cannot make himself an admin', async () => {
++      assertRlsViolation(await users.bob.client.from('group_members').update({ role: 'admin' })
++        .eq('group_id', groupId).eq('user_id', users.bob.id));
++    });
++
++    test('cannot rename the group, remove Alice or rotate the invite', async () => {
++      const { client } = users.bob;
++      assertBlocked(await client.from('groups').update({ name: 'Bob rules' }).eq('id', groupId).select());
++      assertBlocked(await client.from('group_members').delete().eq('group_id', groupId)
++        .eq('user_id', users.alice.id).select());
++      const { error } = await client.rpc('rotate_group_invite', { p_group_id: groupId });
++      assert.equal(error?.code, '42501');
++    });
++
++    test('cannot edit Alice\'s profile', async () => {
++      assertBlocked(await users.bob.client.from('profiles').update({ display_name: 'hacked' })
++        .eq('id', users.alice.id).select());
++    });
++
++    test('cannot close a poll or set its outcome directly', async () => {
++      assertRlsViolation(await users.bob.client.from('polls').update({ status: 'closed' }).eq('id', pollId));
++    });
++
++    test('cannot change votes or suggest options once the poll is closed', async () => {
++      // Close the poll as an administrator (task 5's close-poll function will do this).
++      assert.ifError((await admin.from('polls').update({ status: 'closed' }).eq('id', pollId)).error);
++      const { client, id } = users.bob;
++      assertBlocked(await client.from('votes').update({ option_id: optionId }).eq('user_id', id).select());
++      assertBlocked(await client.from('votes').delete().eq('user_id', id).select());
++      assertRlsViolation(await client.from('options').insert({ poll_id: pollId, restaurant_name: 'Too late' }));
++    });
++  });
++
++  describe('Express only accepts valid Supabase access tokens', () => {
++    let server;
++    let base;
++
++    before(async () => {
++      process.env.SUPABASE_URL = url;
++      process.env.SUPABASE_PUBLISHABLE_KEY = publishableKey;
++      const { createApp } = await import('../server/app.js');
++      server = createApp().listen(0);
++      await new Promise((resolve) => server.once('listening', resolve));
++      base = `http://127.0.0.1:${server.address().port}/api`;
++    });
++
++    after(() => server?.close());
++
++    const get = (path, token) => fetch(`${base}${path}`, {
++      headers: token ? { Authorization: `Bearer ${token}` } : {},
++    });
++
++    test('rejects requests with no token', async () => {
++      assert.equal((await get('/groups')).status, 401);
++    });
++
++    test('rejects a malformed token', async () => {
++      assert.equal((await get('/groups', 'not-a-jwt')).status, 401);
++    });
++
++    test('rejects a token signed with the wrong key', async () => {
++      const encode = (value) => Buffer.from(JSON.stringify(value)).toString('base64url');
++      const header = encode({ alg: 'HS256', typ: 'JWT' });
++      const payload = encode({
++        sub: users.alice.id, role: 'authenticated', aud: 'authenticated',
++        exp: Math.floor(Date.now() / 1000) + 3600,
++      });
++      const signature = createHmac('sha256', 'attacker-chosen-secret').update(`${header}.${payload}`)
++        .digest('base64url');
++      assert.equal((await get('/groups', `${header}.${payload}.${signature}`)).status, 401);
++    });
++
++    test('accepts a real token and applies RLS behind it', async () => {
++      const mine = await get('/groups', users.mallory.token);
++      assert.equal(mine.status, 200);
++      assert.deepEqual((await mine.json()).map((group) => group.id), [strangerGroupId]);
++      assert.equal((await get(`/groups/${groupId}`, users.mallory.token)).status, 404);
++      assert.equal((await get(`/groups/${groupId}`, users.bob.token)).status, 200);
++    });
++  });
++});
+-- 
+2.43.0
+

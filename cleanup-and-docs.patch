@@ -1,0 +1,1958 @@
+From dcca5ffe660980b132a47c1c9afee1c628e8caa5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 19:07:12 +0000
+Subject: [PATCH] Explain and repair group creation failures, tidy code, add
+ project docs
+
+Creating a group failed with a generic "Something went wrong" whenever the
+connected database was missing migrations, or the signed-in account had no
+profile row. Both are now reported clearly, and a new migration creates
+missing profiles and re-asserts the sign-up trigger.
+
+- server/errors.js: schema mismatches return 503 with a pointer to the
+  troubleshooting guide; a missing profile returns a specific message
+- supabase: add 20261124000000_backfill_profiles.sql
+- client: reformat the poll screens and data layer for readability, with
+  clearer errors for a missing poll or an out-of-date database
+- tests: fix a stale option count in the RLS suite, add a regression test
+  for the missing-profile case, run each suite from its own script
+- CI: run the RLS and voting tests against local Supabase
+- docs: rewrite the README and add architecture, Supabase, database and
+  development guides; rename the proposal PDF
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0151zCGMvhKrvR6nM8d9J2rY
+---
+ .env.test.example                             |   2 +-
+ .github/workflows/ci.yml                      |  21 +-
+ README.md                                     | 139 ++-----
+ client/src/main.jsx                           |   7 +-
+ client/src/polls/Polls.jsx                    | 338 ++++++++++++++----
+ client/src/polls/live.js                      |  68 ++--
+ client/src/polls/repository.js                | 126 +++++--
+ client/src/router.js                          |   3 +-
+ docs/architecture.md                          | 149 ++++++++
+ docs/bingrui-handoff.md                       |   7 +
+ docs/database.md                              | 179 ++++++++++
+ docs/development.md                           | 190 ++++++++++
+ ...posal (1) (2).pdf => project-proposal.pdf} | Bin
+ docs/supabase.md                              | 182 ++++++++++
+ package.json                                  |  10 +-
+ server/errors.js                              |  28 ++
+ .../20261124000000_backfill_profiles.sql      |  72 ++++
+ tests/rls-attacks.test.js                     |  28 +-
+ 18 files changed, 1290 insertions(+), 259 deletions(-)
+ create mode 100644 docs/architecture.md
+ create mode 100644 docs/database.md
+ create mode 100644 docs/development.md
+ rename docs/{Group22_ProjectProposal (1) (2).pdf => project-proposal.pdf} (100%)
+ create mode 100644 docs/supabase.md
+ create mode 100644 supabase/migrations/20261124000000_backfill_profiles.sql
+
+diff --git a/.env.test.example b/.env.test.example
+index ff4aeb0..390b162 100644
+--- a/.env.test.example
++++ b/.env.test.example
+@@ -6,7 +6,7 @@ SUPABASE_PUBLISHABLE_KEY=replace-with-local-publishable-key
+ SUPABASE_SECRET_KEY=replace-with-local-secret-key
+ DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:54322/postgres
+ 
+-# Task 6 latency benchmark (requires Devon's RPCs):
++# Realtime latency benchmark (npm run bench:realtime):
+ BENCH_USERS=1,5,10,25,50
+ BENCH_SAMPLES=5
+ BENCH_POLL_MS=1000
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 04aaba4..a11f721 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -1,4 +1,4 @@
+-name: Verify Bingrui frontend
++name: CI
+ on:
+   push:
+   pull_request:
+@@ -6,6 +6,8 @@ on:
+ permissions:
+   contents: read
+ jobs:
++  # Unit tests, the production build and browser tests. No database needed:
++  # the browser tests run the poll screens against a fake data source.
+   frontend:
+     runs-on: ubuntu-latest
+     timeout-minutes: 15
+@@ -25,7 +27,9 @@ jobs:
+         with:
+           name: browser-failures
+           path: test-results/
+-  supabase-setup:
++  # Starts local Supabase (which applies every migration to an empty database),
++  # then runs the security and Realtime tests against it.
++  supabase:
+     runs-on: ubuntu-latest
+     timeout-minutes: 20
+     steps:
+@@ -36,14 +40,21 @@ jobs:
+           cache: npm
+       - run: npm ci
+       - run: npm run db -- start
+-      - run: npm run db -- db reset
+-      - name: Test real Realtime reads and suggestions
++      - name: Export local Supabase credentials
+         shell: bash
+         run: |
+           npx supabase status -o env > /tmp/supabase-status.env
+           set -a
+           source /tmp/supabase-status.env
+           set +a
+-          SUPABASE_URL="$API_URL" SUPABASE_PUBLISHABLE_KEY="$ANON_KEY" SUPABASE_SECRET_KEY="$SERVICE_ROLE_KEY" npm run test:realtime
++          {
++            echo "SUPABASE_URL=$API_URL"
++            echo "SUPABASE_PUBLISHABLE_KEY=$ANON_KEY"
++            echo "SUPABASE_SECRET_KEY=$SERVICE_ROLE_KEY"
++          } >> "$GITHUB_ENV"
++      - name: Row level security, voting and API token tests
++        run: npm run test:rls
++      - name: Realtime integration test
++        run: npm run test:realtime
+       - run: npm run db -- stop --no-backup
+         if: always()
+diff --git a/README.md b/README.md
+index 081486f..eb0578c 100644
+--- a/README.md
++++ b/README.md
+@@ -1,134 +1,67 @@
+ # Where Are We Eating?
+ 
+-A group restaurant polling app with a React frontend, an Express API, and Supabase for the database, sign-in and row level security.
++A group restaurant polling app. Friends make a group, share an invite link, start a poll, suggest restaurants and vote; results update live for everyone, and closing the poll saves the winner.
+ 
+-## Run the app
++- **Frontend:** React 19 + Vite (`client/`)
++- **API:** Express 5 (`server/`), used for profiles and groups
++- **Backend:** Supabase: Postgres, Auth, row level security and Realtime (`supabase/`)
+ 
+-Use Node.js 24. From the repository root, run:
++## Documentation
+ 
+-```bash
+-npm ci
+-npm run dev
+-```
+-
+-Open [http://localhost:5173](http://localhost:5173). The frontend runs on port 5173 and the API runs on port 3000. Check [http://localhost:3000/api/health](http://localhost:3000/api/health) to see the API and Supabase connection status.
+-
+-## Connect to Supabase
+-
+-Both the browser and the API use the project URL and the **publishable** key. Copy the examples and fill them in:
+-
+-```bash
+-cp client/.env.example client/.env
+-cp server/.env.example server/.env
+-```
+-
+-Get the values from your Supabase project's **Connect** dialog or **Project Settings → API Keys**, or from `npm run db -- status` for local Supabase. Restart `npm run dev` after changing them. Never put the secret (service role) key in either file: the app does not need it.
+-
+-## Database migrations
+-
+-The schema lives in `supabase/migrations/`:
+-
+-| Migration | What it does |
++| Read this | To learn |
+ | --- | --- |
+-| `20261114000000_core_schema.sql` | The six tables, keys, one-vote-per-user rule, “option belongs to this poll” rule and the profile-on-sign-up trigger (task 2). |
+-| `20261116000000_groups_and_rls.sql` | Invite codes, `join_group()` and `rotate_group_invite()`, table grants and the row level security policies (task 4). |
++| [docs/architecture.md](docs/architecture.md) | How the pieces fit together, what each file does, and how a request flows |
++| [docs/supabase.md](docs/supabase.md) | How we use Supabase: keys, sign-in, row level security, database functions, Realtime, migrations |
++| [docs/database.md](docs/database.md) | Every table, constraint, policy and function |
++| [docs/development.md](docs/development.md) | Setup, everyday commands, tests, benchmarks, CI and **troubleshooting** |
+ 
+-Local Supabase applies them automatically on `npm run db -- start` and `npm run db -- db reset`. To apply them to the hosted project with the Supabase CLI, first log in and link the project:
++Task reports from the project: [task 5 voting and performance](docs/task5-voting-performance.md), [tasks 1 and 6 poll screens and Realtime](docs/bingrui-handoff.md), and the original [project proposal](docs/project-proposal.pdf).
+ 
+-```bash
+-npx supabase login
+-```
++## Quick start
+ 
+-```bash
+-npx supabase link --project-ref YOUR_PROJECT_REF
+-```
+-
+-The hosted project already contains the core schema, so mark that migration as applied once instead of running it again:
++You need Node.js 24 (see `.nvmrc`) and Docker (for local Supabase).
+ 
+ ```bash
+-npx supabase migration repair --status applied 20261114000000
+-```
+-
+-Then push the remaining migrations:
+-
+-```bash
+-npx supabase db push
++npm ci
+ ```
+ 
+-## How sign-in works (Supabase Auth)
+-
+-- The React app signs users up and in with `supabase.auth.signUp()` and `supabase.auth.signInWithPassword()`. The username and display name are sent as user metadata, and the `on_auth_user_created` trigger copies them into `public.profiles`.
+-- Supabase Auth stores the session in the browser, refreshes the access token before it expires, and reports changes through `onAuthStateChange`. Password resets use `resetPasswordForEmail()` and `updateUser()`.
+-- Every API request sends `Authorization: Bearer <access token>`. Express verifies it with `supabase.auth.getClaims()` (`server/auth.js`) and rejects missing, expired or forged tokens with 401.
+-- Express then queries Supabase **as that user** by forwarding the same token, so `auth.uid()` is the user's id and row level security applies to every query. Express never bypasses RLS.
+-
+-## Groups and row level security
+-
+-- Creating a group inserts into `groups`; a trigger makes the creator its admin.
+-- Invite links look like `/join/<code>`. The code is 32 random hex characters, and only `join_group(code)` can add someone to a group. Admins can replace the code with **New link**.
+-- Policies let users read only the groups they belong to and the polls, options, votes and profiles of those groups. Members can create polls, suggest options and cast, change or remove their own vote while a poll is open. Admins can rename or delete the group and remove members.
+-- Signed-out (`anon`) requests have no table privileges at all.
+-
+-### Attack tests
+-
+-`tests/rls-attacks.test.js` calls the Supabase API directly as three users (an admin, a member and an outsider) and checks that every attempt to read or change another group's data is blocked. It also checks that Express rejects missing, malformed and forged tokens. Run it against local Supabase:
+-
+ ```bash
+ npm run db -- start
+-cp .env.test.example .env.test
+-npm run test:rls
+ ```
+ 
+-Fill `.env.test` with the API URL, publishable key and secret key from `npm run db -- status`. The secret key is used only to create and delete the test users.
+-
+-### Cost of RLS
+-
+-`benchmarks/rls-cost.js` seeds three data sizes (50, 500 and 5,000 groups) inside a transaction that is rolled back. It times the app's main queries under RLS and as hand-written membership checks with RLS bypassed, which is what an Express-only app would do. Run it against local Supabase:
++`db start` downloads and runs Supabase locally and applies every migration. When it finishes it prints an API URL and keys (run `npm run db -- status` to see them again). Copy the example environment files and paste in the **API URL** and **publishable key**:
+ 
+ ```bash
+-npm run bench:rls
++cp client/.env.example client/.env
+ ```
+ 
+-Results are written to `benchmarks/results/rls-cost.csv`, with query plans in `benchmarks/results/rls-plans.txt`.
+-
+-## Use local Supabase
+-
+-Install and start Docker, then run from the repository root:
+-
+ ```bash
+-npm run db -- start
+-npm run db -- status
++cp server/.env.example server/.env
+ ```
+ 
+-Use the local API URL and publishable key shown by `status` in `client/.env` and `server/.env`. Local Supabase Studio is at [http://127.0.0.1:54323](http://127.0.0.1:54323), and emails sent by local Auth (confirmations, password resets) appear at [http://127.0.0.1:54324](http://127.0.0.1:54324). Stop the stack when finished:
++Then start the app:
+ 
+ ```bash
+-npm run db -- stop
++npm run dev
+ ```
+ 
+-## Poll screens and live updates (Bingrui)
++Open [http://localhost:5173](http://localhost:5173). The frontend runs on port 5173 and proxies `/api` to Express on port 3000. [http://localhost:3000/api/health](http://localhost:3000/api/health) shows whether Express can reach Supabase.
+ 
+-Open a group to create a restaurant poll, suggest restaurants, vote and view the
+-saved result. Poll screens subscribe to Supabase Postgres Changes and recover
+-missed updates after reconnecting. The additional migration
+-`20261118000000_poll_realtime.sql` enables publication of existing poll data;
+-it does not change RLS policies.
++To use the shared hosted Supabase project instead of a local one, see [docs/development.md](docs/development.md#using-the-hosted-project).
+ 
+-Vote/close actions require Devon's task 5 functions. Their proposed RPC contract,
+-frontend and real Realtime tests, CI setup and the 1–50-user latency comparison
+-are documented in [Bingrui's handoff](docs/bingrui-handoff.md).
++## Commands
+ 
+-```bash
+-npm test
+-npm run build
+-npx playwright install chromium
+-npm run test:browser
+-# Requires local Supabase credentials in .env.test:
+-npm run test:realtime
+-# Also requires Devon's vote RPC:
+-npm run bench:realtime
+-```
+-
+-Browser tests use a fake transport to check frontend behavior. Real Realtime
+-integration and latency tests are separate commands; no real latency claim is
+-made by the frontend test suite.
++| Command | What it does |
++| --- | --- |
++| `npm run dev` | Run Express and Vite together with reload |
++| `npm run build` / `npm start` | Build the frontend, then serve it and the API from Express |
++| `npm run db -- <args>` | The Supabase CLI (`start`, `stop`, `status`, `db reset`, `migration new`, …) |
++| `npm test` | Unit tests for the poll data layer (no database) |
++| `npm run test:browser` | Playwright tests of the poll screens against a fake data source |
++| `npm run test:rls` | Security, voting and API-token tests against local Supabase |
++| `npm run test:realtime` | Realtime integration test against local Supabase |
++| `npm run bench:rls`, `bench:voting`, `bench:realtime` | The three performance experiments |
++
++## Something not working?
++
++Start with [Troubleshooting](docs/development.md#troubleshooting). The most common problem, "I can sign in but cannot create a group", means the database you are connected to is missing migrations.
+diff --git a/client/src/main.jsx b/client/src/main.jsx
+index 8090bf0..4d6112c 100644
+--- a/client/src/main.jsx
++++ b/client/src/main.jsx
+@@ -3,11 +3,11 @@ import { createRoot } from 'react-dom/client';
+ import { api } from './api.js';
+ import { AuthScreen, NewPasswordScreen } from './AuthScreen.jsx';
+ import { GroupPage, GroupsPage } from './Groups.jsx';
++import { PollPage } from './polls/Polls.jsx';
+ import { navigate, usePath } from './router.js';
+ import { SessionProvider, useSession } from './session.jsx';
+ import { isSupabaseConfigured, supabase } from './supabase.js';
+ import './styles.css';
+-import { PollPage } from './polls/Polls.jsx';
+ 
+ const PENDING_INVITE = 'pendingInvite';
+ 
+@@ -109,10 +109,13 @@ function App() {
+   } else {
+     const groupId = /^\/groups\/([^/]+)$/.exec(path)?.[1];
+     const pollId = /^\/polls\/([0-9a-f-]{36})$/i.exec(path)?.[1];
++    let page = <GroupsPage />;
++    if (pollId) page = <PollPage key={pollId} pollId={pollId} userId={session.user.id} />;
++    else if (groupId) page = <GroupPage key={groupId} groupId={groupId} userId={session.user.id} />;
+     content = (
+       <>
+         {invite.error && <p className="error" role="alert">{invite.error}</p>}
+-        {pollId ? <PollPage key={pollId} pollId={pollId} userId={session.user.id} /> : groupId ? <GroupPage key={groupId} groupId={groupId} userId={session.user.id} /> : <GroupsPage />}
++        {page}
+       </>
+     );
+   }
+diff --git a/client/src/polls/Polls.jsx b/client/src/polls/Polls.jsx
+index 0308a01..ebf56c9 100644
+--- a/client/src/polls/Polls.jsx
++++ b/client/src/polls/Polls.jsx
+@@ -1,130 +1,312 @@
+ import { useEffect, useRef, useState } from 'react';
+-import { supabase } from '../supabase.js';
+ import { navigate } from '../router.js';
+-import { createPollRepository } from './repository.js';
++import { supabase } from '../supabase.js';
+ import { watchPoll } from './live.js';
++import { createPollRepository } from './repository.js';
+ 
+ const defaultRepository = createPollRepository(supabase);
+-const statuses = { connecting: 'Connecting to live updates…', live: 'Live updates',
+-  reconnecting: 'Reconnecting · checking for updates', offline: 'Offline · results may be out of date' };
+ 
++const statusLabels = {
++  connecting: 'Connecting to live updates…',
++  live: 'Live updates',
++  reconnecting: 'Reconnecting · checking for updates',
++  offline: 'Offline · results may be out of date',
++};
++
++const priceRanges = ['$', '$$', '$$$', '$$$$'];
++
++const plural = (count, word) => `${count} ${count === 1 ? word : `${word}s`}`;
++
++// The list of polls in a group, with a form to start a new one.
+ export function GroupPolls({ groupId, repository = defaultRepository }) {
+   const [polls, setPolls] = useState(null);
+   const [question, setQuestion] = useState('');
+   const [error, setError] = useState('');
+   const [busy, setBusy] = useState(false);
+-  const [reload, setReload] = useState(0);
++  const [reloadCount, setReloadCount] = useState(0);
++
+   useEffect(() => {
+     let active = true;
+     setPolls(null);
+-    repository.list(groupId).then((data) => { if (active) { setPolls(data); setError(''); } })
+-      .catch((caught) => { if (active) setError(caught.message); });
++    repository.list(groupId)
++      .then((data) => {
++        if (!active) return;
++        setPolls(data);
++        setError('');
++      })
++      .catch((caught) => {
++        if (active) setError(caught.message);
++      });
+     return () => { active = false; };
+-  }, [groupId, repository, reload]);
++  }, [groupId, repository, reloadCount]);
++
+   async function create(event) {
+     event.preventDefault();
+     if (busy || !question.trim()) return;
+-    setBusy(true); setError('');
++    setBusy(true);
++    setError('');
+     try {
+       const poll = await repository.create(groupId, question.trim());
+       navigate(`/polls/${poll.id}`);
+-    } catch (caught) { setError(caught.message); }
+-    finally { setBusy(false); }
++    } catch (caught) {
++      setError(caught.message);
++    } finally {
++      setBusy(false);
++    }
+   }
+-  return <section className="card">
+-    <h2>Restaurant polls</h2>
+-    {error && <p className="error" role="alert">{error} <button className="link" onClick={() => setReload((n) => n + 1)}>Retry</button></p>}
+-    {!polls && !error && <p role="status">Loading polls…</p>}
+-    {polls?.length === 0 && <p className="muted">No polls yet. Start one to pick your next meal.</p>}
+-    <ul className="list">{polls?.map((poll) => <li key={poll.id}>
+-      <a href={`/polls/${poll.id}`} onClick={(event) => { event.preventDefault(); navigate(`/polls/${poll.id}`); }}>{poll.question}</a>
+-      <span className="badge">{poll.status === 'open' ? 'Open' : 'Closed'}</span>
+-    </li>)}</ul>
+-    <form className="stack poll-create" onSubmit={create}>
+-      <label>Poll question<input value={question} onChange={(event) => setQuestion(event.target.value)} required maxLength={200} placeholder="Where should we eat tonight?" /></label>
+-      <button disabled={busy || !question.trim()}>{busy ? 'Creating…' : 'Create poll'}</button>
+-    </form>
+-  </section>;
++
++  return (
++    <section className="card">
++      <h2>Restaurant polls</h2>
++      {error && (
++        <p className="error" role="alert">
++          {error}{' '}
++          <button type="button" className="link" onClick={() => setReloadCount((count) => count + 1)}>Retry</button>
++        </p>
++      )}
++      {!polls && !error && <p role="status">Loading polls…</p>}
++      {polls?.length === 0 && <p className="muted">No polls yet. Start one to pick your next meal.</p>}
++
++      <ul className="list">
++        {polls?.map((poll) => (
++          <li key={poll.id}>
++            <a
++              href={`/polls/${poll.id}`}
++              onClick={(event) => { event.preventDefault(); navigate(`/polls/${poll.id}`); }}
++            >
++              {poll.question}
++            </a>
++            <span className="badge">{poll.status === 'open' ? 'Open' : 'Closed'}</span>
++          </li>
++        ))}
++      </ul>
++
++      <form className="stack poll-create" onSubmit={create}>
++        <label>
++          Poll question
++          <input
++            value={question}
++            onChange={(event) => setQuestion(event.target.value)}
++            required
++            maxLength={200}
++            placeholder="Where should we eat tonight?"
++          />
++        </label>
++        <button type="submit" disabled={busy || !question.trim()}>{busy ? 'Creating…' : 'Create poll'}</button>
++      </form>
++    </section>
++  );
+ }
+ 
++// One poll: live results, voting, suggesting restaurants and (for its creator) closing.
+ export function PollPage({ pollId, userId, repository = defaultRepository }) {
+   const [snapshot, setSnapshot] = useState(null);
+   const [error, setError] = useState('');
+   const [actionError, setActionError] = useState('');
+   const [busy, setBusy] = useState(false);
+-  const [confirm, setConfirm] = useState(false);
++  const [confirmingClose, setConfirmingClose] = useState(false);
+   const [status, setStatus] = useState('connecting');
+   const watcher = useRef(null);
+   const actionLock = useRef(false);
++
+   useEffect(() => {
+-    setSnapshot(null); setError(''); setActionError(''); setConfirm(false);
+-    const stream = watchPoll({ repository, pollId, userId, onData: setSnapshot, onError: setError, onStatus: setStatus });
++    setSnapshot(null);
++    setError('');
++    setActionError('');
++    setConfirmingClose(false);
++    const stream = watchPoll({
++      repository, pollId, userId, onData: setSnapshot, onError: setError, onStatus: setStatus,
++    });
+     watcher.current = stream;
+-    return () => { stream.stop(); watcher.current = null; };
++    return () => {
++      stream.stop();
++      watcher.current = null;
++    };
+   }, [repository, pollId, userId]);
+-  async function act(operation, done) {
++
++  // Run one write at a time, then re-read the poll whether it worked or not.
++  async function act(operation, onSuccess) {
+     if (actionLock.current) return;
+     actionLock.current = true;
+-    setBusy(true); setActionError('');
+-    try { await operation(); done?.(); }
+-    catch (caught) { setActionError(caught.message); }
+-    finally { await watcher.current?.refresh(); actionLock.current = false; setBusy(false); }
++    setBusy(true);
++    setActionError('');
++    try {
++      await operation();
++      onSuccess?.();
++    } catch (caught) {
++      setActionError(caught.message);
++    } finally {
++      await watcher.current?.refresh();
++      actionLock.current = false;
++      setBusy(false);
++    }
+   }
++
+   function suggest(event) {
+     event.preventDefault();
+     const form = event.currentTarget;
+     const values = new FormData(form);
+-    const restaurant_name = String(values.get('restaurant_name')).trim();
+-    if (!restaurant_name) return;
++    const restaurantName = String(values.get('restaurant_name')).trim();
++    if (!restaurantName) return;
+     void act(() => repository.suggest(pollId, {
+-      restaurant_name, food_category: String(values.get('food_category')).trim() || null,
++      restaurant_name: restaurantName,
++      food_category: String(values.get('food_category')).trim() || null,
+       price_range: String(values.get('price_range')) || null,
+     }), () => form.reset());
+   }
+-  if (!snapshot) return <section className="card">
+-    {error ? <><p className="error" role="alert">{error}</p><button onClick={() => watcher.current?.refresh()}>Retry</button></> : <p role="status">Loading poll…</p>}
+-    <p><button className="link" onClick={() => navigate('/')}>Back to your groups</button></p>
+-  </section>;
++
++  if (!snapshot) {
++    return (
++      <section className="card">
++        {error ? (
++          <>
++            <p className="error" role="alert">{error}</p>
++            <button type="button" onClick={() => watcher.current?.refresh()}>Retry</button>
++          </>
++        ) : (
++          <p role="status">Loading poll…</p>
++        )}
++        <p><button type="button" className="link" onClick={() => navigate('/')}>Back to your groups</button></p>
++      </section>
++    );
++  }
++
+   const open = snapshot.status === 'open';
++  const offline = status === 'offline';
+   const total = snapshot.options.reduce((sum, option) => sum + option.vote_count, 0);
+   const winner = snapshot.options.find((option) => option.id === snapshot.saved_outcome_option_id);
+-  return <>
+-    <p><button className="link" onClick={() => navigate(`/groups/${snapshot.group_id}`)}>← Back to group</button></p>
+-    <section className="card">
+-      <div className="row poll-heading"><span className="badge">{open ? 'Open' : 'Closed'}</span><span className={`live-status ${status}`} role="status">{statuses[status]}</span></div>
+-      <h2>{snapshot.question}</h2>
+-      <p className="muted">{open ? 'Suggest a restaurant, then choose your favorite.' : 'Voting has ended.'}</p>
+-      {error && <p className="error" role="alert">{error} <button className="link" onClick={() => watcher.current?.refresh()}>Retry</button></p>}
+-      {actionError && <p className="error" role="alert">{actionError}</p>}
+-      {!open && <div className="notice"><h3>Final result</h3><p>{winner ? winner.restaurant_name : 'No restaurant was selected.'}</p></div>}
+-      <p aria-live="polite">{total} {total === 1 ? 'vote' : 'votes'} cast{snapshot.my_option_id ? ' · You’ve voted' : ''}</p>
+-      {snapshot.options.length === 0 && <p className="muted">No restaurants suggested yet.</p>}
+-      <ul className="list options">{snapshot.options.map((option) => <li key={option.id}>
+-        <div className="option-content"><h3>{option.restaurant_name}{snapshot.my_option_id === option.id && <span className="badge">Your vote</span>}</h3>
+-          <p className="muted">{[option.food_category, option.price_range].filter(Boolean).join(' · ') || 'No extra details'}</p>
+-          <meter min="0" max={total || 1} value={option.vote_count} aria-label={`Vote share for ${option.restaurant_name}`} />
++
++  return (
++    <>
++      <p>
++        <button type="button" className="link" onClick={() => navigate(`/groups/${snapshot.group_id}`)}>
++          ← Back to group
++        </button>
++      </p>
++
++      <section className="card">
++        <div className="row poll-heading">
++          <span className="badge">{open ? 'Open' : 'Closed'}</span>
++          <span className={`live-status ${status}`} role="status">{statusLabels[status]}</span>
+         </div>
+-        <div className="stack option-actions"><strong>{option.vote_count} {option.vote_count === 1 ? 'vote' : 'votes'}</strong>
+-          {open && <button className="secondary" disabled={busy || snapshot.my_option_id === option.id || status === 'offline'}
+-            aria-label={`Vote for ${option.restaurant_name}`} onClick={() => act(() => repository.vote(pollId, option.id))}>
+-            {snapshot.my_option_id === option.id ? 'Selected' : snapshot.my_option_id ? 'Change vote' : 'Vote'}
+-          </button>}
++        <h2>{snapshot.question}</h2>
++        <p className="muted">{open ? 'Suggest a restaurant, then choose your favorite.' : 'Voting has ended.'}</p>
++
++        {error && (
++          <p className="error" role="alert">
++            {error}{' '}
++            <button type="button" className="link" onClick={() => watcher.current?.refresh()}>Retry</button>
++          </p>
++        )}
++        {actionError && <p className="error" role="alert">{actionError}</p>}
++
++        {!open && (
++          <div className="notice">
++            <h3>Final result</h3>
++            <p>{winner ? winner.restaurant_name : 'No restaurant was selected.'}</p>
++          </div>
++        )}
++
++        <p aria-live="polite">
++          {plural(total, 'vote')} cast{snapshot.my_option_id ? ' · You’ve voted' : ''}
++        </p>
++        {snapshot.options.length === 0 && <p className="muted">No restaurants suggested yet.</p>}
++
++        <ul className="list options">
++          {snapshot.options.map((option) => {
++            const mine = snapshot.my_option_id === option.id;
++            return (
++              <li key={option.id}>
++                <div className="option-content">
++                  <h3>
++                    {option.restaurant_name}
++                    {mine && <span className="badge">Your vote</span>}
++                  </h3>
++                  <p className="muted">
++                    {[option.food_category, option.price_range].filter(Boolean).join(' · ') || 'No extra details'}
++                  </p>
++                  <meter
++                    min="0"
++                    max={total || 1}
++                    value={option.vote_count}
++                    aria-label={`Vote share for ${option.restaurant_name}`}
++                  />
++                </div>
++                <div className="stack option-actions">
++                  <strong>{plural(option.vote_count, 'vote')}</strong>
++                  {open && (
++                    <button
++                      type="button"
++                      className="secondary"
++                      disabled={busy || mine || offline}
++                      aria-label={`Vote for ${option.restaurant_name}`}
++                      onClick={() => act(() => repository.vote(pollId, option.id))}
++                    >
++                      {mine ? 'Selected' : snapshot.my_option_id ? 'Change vote' : 'Vote'}
++                    </button>
++                  )}
++                </div>
++              </li>
++            );
++          })}
++        </ul>
++      </section>
++
++      {open && (
++        <div className="columns">
++          <section className="card">
++            <h3>Suggest a restaurant</h3>
++            <form onSubmit={suggest}>
++              <fieldset className="stack" disabled={busy || offline}>
++                <label>
++                  Restaurant name
++                  <input name="restaurant_name" required maxLength={100} />
++                </label>
++                <label>
++                  Food category
++                  <input name="food_category" maxLength={60} placeholder="Italian, Thai, …" />
++                </label>
++                <label>
++                  Price range
++                  <select name="price_range" defaultValue="">
++                    <option value="">Not specified</option>
++                    {priceRanges.map((value) => <option key={value}>{value}</option>)}
++                  </select>
++                </label>
++                <button type="submit">Add restaurant</button>
++              </fieldset>
++            </form>
++          </section>
++
++          {snapshot.created_by === userId && (
++            <section className="card">
++              <h3>Close poll</h3>
++              <p>End voting and save the final result.</p>
++              {confirmingClose ? (
++                <>
++                  <p>Ready to close this poll?</p>
++                  <div className="row">
++                    <button
++                      type="button"
++                      disabled={busy || offline}
++                      onClick={() => act(() => repository.close(pollId), () => setConfirmingClose(false))}
++                    >
++                      Confirm close
++                    </button>
++                    <button type="button" className="secondary" disabled={busy} onClick={() => setConfirmingClose(false)}>
++                      Cancel
++                    </button>
++                  </div>
++                </>
++              ) : (
++                <button type="button" className="secondary" disabled={busy || offline} onClick={() => setConfirmingClose(true)}>
++                  Close poll
++                </button>
++              )}
++            </section>
++          )}
+         </div>
+-      </li>)}</ul>
+-    </section>
+-    {open && <div className="columns">
+-      <section className="card"><h3>Suggest a restaurant</h3><form onSubmit={suggest}>
+-        <fieldset className="stack" disabled={busy || status === 'offline'}>
+-          <label>Restaurant name<input name="restaurant_name" required maxLength={100} /></label>
+-          <label>Food category<input name="food_category" maxLength={60} placeholder="Italian, Thai, …" /></label>
+-          <label>Price range<select name="price_range" defaultValue=""><option value="">Not specified</option>{['$', '$$', '$$$', '$$$$'].map((value) => <option key={value}>{value}</option>)}</select></label>
+-          <button>Add restaurant</button>
+-        </fieldset>
+-      </form></section>
+-      {snapshot.created_by === userId && <section className="card"><h3>Close poll</h3><p>End voting and save the final result.</p>
+-        {confirm ? <><p>Ready to close this poll?</p><div className="row"><button disabled={busy || status === 'offline'} onClick={() => act(() => repository.close(pollId), () => setConfirm(false))}>Confirm close</button><button className="secondary" disabled={busy} onClick={() => setConfirm(false)}>Cancel</button></div></>
+-          : <button className="secondary" disabled={busy || status === 'offline'} onClick={() => setConfirm(true)}>Close poll</button>}
+-      </section>}
+-    </div>}
+-  </>;
++      )}
++    </>
++  );
+ }
+diff --git a/client/src/polls/live.js b/client/src/polls/live.js
+index 418a3b6..df3ed59 100644
+--- a/client/src/polls/live.js
++++ b/client/src/polls/live.js
+@@ -1,24 +1,41 @@
+-// Serialized snapshots: an event arriving during a fetch queues another fetch.
+-// This prevents an older request from replacing newer state, without losing bursts.
+-export function watchPoll({ repository, pollId, userId, onData, onError, onStatus,
+-  events = globalThis.window, visibility = globalThis.document, fallbackMs = 5000, reconcileMs = 30000 }) {
++// Keeps one poll's snapshot up to date and reports the connection status.
++//
++// Realtime events are only a signal to re-read: every change triggers a fresh snapshot
++// through repository.read(). Reads are serialized, and an event that arrives during a
++// read queues exactly one more, so an older response can never replace newer state and
++// a burst of events costs at most one extra request.
++//
++// Missed events are recovered by re-reading when the stream (re)connects, when the
++// browser comes back online or the tab becomes visible, every `fallbackMs` while the
++// stream is not confirmed live, and every `reconcileMs` even when it is (this also
++// picks up deletes, which are not subscribed to).
++export function watchPoll({
++  repository, pollId, userId, onData, onError, onStatus,
++  events = globalThis.window, visibility = globalThis.document,
++  fallbackMs = 5000, reconcileMs = 30000,
++}) {
+   let stopped = false;
+   let running = null;
+   let dirty = false;
+   let live = false;
+   let lastRead = 0;
+-  let stopObserve = () => {};
++  let stopObserving = () => {};
+ 
+   function refresh() {
+     if (stopped) return Promise.resolve();
+     dirty = true;
+     if (running) return running;
++
+     running = (async () => {
+       while (dirty && !stopped) {
+         dirty = false;
+         try {
+-          const value = await repository.read(pollId, userId);
+-          if (!stopped) { lastRead = Date.now(); onData(value); onError(''); }
++          const snapshot = await repository.read(pollId, userId);
++          if (!stopped) {
++            lastRead = Date.now();
++            onData(snapshot);
++            onError('');
++          }
+         } catch (error) {
+           if (!stopped) onError(error.message);
+         }
+@@ -26,34 +43,43 @@ export function watchPoll({ repository, pollId, userId, onData, onError, onStatu
+     })().finally(() => { running = null; });
+     return running;
+   }
+-  function status(value) {
++
++  function setStatus(value) {
+     if (stopped) return;
+     live = value === 'live';
+     onStatus(value);
+     if (live) void refresh();
+   }
+-  const offline = () => { live = false; onStatus('offline'); };
+-  const online = () => { onStatus('reconnecting'); void refresh(); };
+-  const visible = () => { if (visibility?.visibilityState !== 'hidden') void refresh(); };
++
++  const isHidden = () => visibility?.visibilityState === 'hidden';
++  const onOffline = () => { live = false; onStatus('offline'); };
++  const onOnline = () => { onStatus('reconnecting'); void refresh(); };
++  const onVisibilityChange = () => { if (!isHidden()) void refresh(); };
++
+   onStatus('connecting');
+-  try { stopObserve = repository.observe(pollId, refresh, status); }
+-  catch { onStatus('reconnecting'); }
++  try {
++    stopObserving = repository.observe(pollId, refresh, setStatus);
++  } catch {
++    onStatus('reconnecting');
++  }
+   void refresh();
++
+   const timer = setInterval(() => {
+-    if (visibility?.visibilityState !== 'hidden' && (!live || Date.now() - lastRead >= reconcileMs)) void refresh();
++    if (!isHidden() && (!live || Date.now() - lastRead >= reconcileMs)) void refresh();
+   }, fallbackMs);
+-  events?.addEventListener('online', online);
+-  events?.addEventListener('offline', offline);
+-  visibility?.addEventListener('visibilitychange', visible);
++  events?.addEventListener('online', onOnline);
++  events?.addEventListener('offline', onOffline);
++  visibility?.addEventListener('visibilitychange', onVisibilityChange);
++
+   return {
+     refresh,
+     stop() {
+       stopped = true;
+       clearInterval(timer);
+-      stopObserve();
+-      events?.removeEventListener('online', online);
+-      events?.removeEventListener('offline', offline);
+-      visibility?.removeEventListener('visibilitychange', visible);
++      stopObserving();
++      events?.removeEventListener('online', onOnline);
++      events?.removeEventListener('offline', onOffline);
++      visibility?.removeEventListener('visibilitychange', onVisibilityChange);
+     },
+   };
+ }
+diff --git a/client/src/polls/repository.js b/client/src/polls/repository.js
+index a1d74ac..e995dd7 100644
+--- a/client/src/polls/repository.js
++++ b/client/src/polls/repository.js
+@@ -1,67 +1,119 @@
+-// Task 6 adapter. Uses the task 5 RPCs for vote writes and vote totals.
++// Everything the poll screens read from or write to Supabase goes through this object.
++// Unlike groups (which go through the Express API), polls talk to Supabase directly
++// from the browser with the signed-in user's session, so row level security applies
++// and Realtime can push changes. The UI and the tests can swap in a fake repository.
++
++// The query names a table, column or function the database does not have.
++const schemaMismatchCodes = new Set([
++  '42P01', '42703', '42883', 'PGRST200', 'PGRST202', 'PGRST204', 'PGRST205',
++]);
++
++function toError(error) {
++  if (schemaMismatchCodes.has(error.code)) {
++    return new Error('Polls are not available yet: the database is missing the latest migrations.');
++  }
++  if (error.code === 'PGRST116') return new Error('Poll not found.');
++  return new Error(error.message);
++}
++
+ export function createPollRepository(client) {
+   function db() {
+     if (!client) throw new Error('Please configure Supabase and sign in.');
+     return client;
+   }
++
+   async function unwrap(query) {
+     const { data, error } = await query;
+-    if (error) throw new Error(error.message);
++    if (error) throw toError(error);
+     return data;
+   }
+-  async function command(name, args) {
+-    const { error } = await db().rpc(name, args);
+-    if (error) {
+-      if (error.code === 'PGRST202' || error.code === '42883') {
+-        throw new Error('Voting is not available yet. Please try again later.');
+-      }
+-      throw new Error(error.message);
+-    }
+-  }
++
+   return {
+-    list: (groupId) => unwrap(db().from('polls').select('id, question, status, created_at')
+-      .eq('group_id', groupId).order('created_at', { ascending: false })),
+-    create: (groupId, question) => unwrap(db().from('polls').insert({ group_id: groupId, question })
+-      .select('id').single()),
++    list(groupId) {
++      return unwrap(db().from('polls')
++        .select('id, question, status, created_at')
++        .eq('group_id', groupId)
++        .order('created_at', { ascending: false }));
++    },
++
++    // created_by defaults to auth.uid() in the database.
++    create(groupId, question) {
++      return unwrap(db().from('polls')
++        .insert({ group_id: groupId, question })
++        .select('id')
++        .single());
++    },
++
++    // One consistent snapshot of a poll: its options, each option's vote count and
++    // the current user's own vote. The UI never counts votes from Realtime payloads.
+     async read(pollId, userId) {
+-      const [poll, own, totals] = await Promise.all([
+-        unwrap(db().from('polls').select(`id, group_id, question, created_by, status, saved_outcome_option_id,
+-          options:options!options_poll_id_fkey(id, restaurant_name, food_category, price_range, created_at)`)
+-          .eq('id', pollId).single()),
+-        unwrap(db().from('votes').select('option_id').eq('poll_id', pollId).eq('user_id', userId).maybeSingle()),
++      const [poll, ownVote, totals] = await Promise.all([
++        unwrap(db().from('polls')
++          .select(`id, group_id, question, created_by, status, saved_outcome_option_id,
++            options:options!options_poll_id_fkey(id, restaurant_name, food_category, price_range, created_at)`)
++          .eq('id', pollId)
++          .single()),
++        unwrap(db().from('votes')
++          .select('option_id')
++          .eq('poll_id', pollId)
++          .eq('user_id', userId)
++          .maybeSingle()),
+         unwrap(db().rpc('get_vote_totals', { p_poll_id: pollId })),
+       ]);
++
+       const counts = new Map(totals.map(({ option_id, vote_count }) => [option_id, Number(vote_count)]));
+-      const options = poll.options.map((option) => ({ ...option, vote_count: counts.get(option.id) ?? 0 }))
++      const options = poll.options
++        .map((option) => ({ ...option, vote_count: counts.get(option.id) ?? 0 }))
+         .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id));
+-      return { ...poll, options, my_option_id: own?.option_id ?? null };
++      return { ...poll, options, my_option_id: ownVote?.option_id ?? null };
+     },
+-    suggest: (pollId, values) => unwrap(db().from('options').insert({ poll_id: pollId, ...values })),
+-    vote: (pollId, optionId) => command('cast_vote', { p_poll_id: pollId, p_option_id: optionId }),
+-    close: (pollId) => command('close_poll', { p_poll_id: pollId }),
++
++    suggest(pollId, values) {
++      return unwrap(db().from('options').insert({ poll_id: pollId, ...values }));
++    },
++
++    // Votes and closing go through database functions that lock the poll row, so a
++    // vote can never be counted after the poll closes. Clients cannot write votes directly.
++    async vote(pollId, optionId) {
++      await unwrap(db().rpc('cast_vote', { p_poll_id: pollId, p_option_id: optionId }));
++    },
++
++    async close(pollId) {
++      await unwrap(db().rpc('close_poll', { p_poll_id: pollId }));
++    },
++
++    // Subscribe to Postgres Changes for one poll. `changed` is called whenever something
++    // may have changed (the caller re-reads the snapshot); `status` reports 'live' or
++    // 'reconnecting'. Returns a function that removes the subscription.
+     observe(pollId, changed, status) {
+       const channel = db().channel(`poll:${pollId}:${crypto.randomUUID()}`);
+-      for (const table of ['polls', 'options', 'votes']) {
+-        for (const event of (table === 'polls' ? ['UPDATE'] : ['INSERT', 'UPDATE'])) {
+-          channel.on('postgres_changes', {
+-            event, schema: 'public', table, filter: `${table === 'polls' ? 'id' : 'poll_id'}=eq.${pollId}`,
+-          }, changed);
+-        }
++      const bindings = [
++        ['polls', 'UPDATE'],
++        ['options', 'INSERT'], ['options', 'UPDATE'],
++        ['votes', 'INSERT'], ['votes', 'UPDATE'],
++      ];
++      // No DELETE bindings: Supabase cannot filter delete events by column, so the
++      // periodic snapshot in live.js reconciles deletes instead.
++      for (const [table, event] of bindings) {
++        const filter = `${table === 'polls' ? 'id' : 'poll_id'}=eq.${pollId}`;
++        channel.on('postgres_changes', { event, schema: 'public', table, filter }, changed);
+       }
+-      // A joined socket alone doesn't prove that Postgres Changes is working.
++
++      // A joined socket alone doesn't prove that Postgres Changes is working: wait for
++      // the server to acknowledge the bindings (one message covers all of them).
+       channel.on('system', '*', (message) => {
+         if (message.extension !== 'postgres_changes') return;
+         if (message.status === 'ok') {
+-          // Supabase acknowledges all bindings together for this channel.
+           status('live');
+           changed();
+-        } else status('reconnecting');
+-      });
+-      channel.subscribe((value) => {
+-        if (value !== 'SUBSCRIBED') {
++        } else {
+           status('reconnecting');
+         }
+       });
++      channel.subscribe((state) => {
++        if (state !== 'SUBSCRIBED') status('reconnecting');
++      });
++
+       return () => { void client.removeChannel(channel); };
+     },
+   };
+diff --git a/client/src/router.js b/client/src/router.js
+index 623f31b..b3acc90 100644
+--- a/client/src/router.js
++++ b/client/src/router.js
+@@ -1,6 +1,7 @@
+ import { useEffect, useState } from 'react';
+ 
+-// Minimal client-side routing: /, /groups/<id>, /join/<code>, /reset-password.
++// Minimal client-side routing: /, /groups/<id>, /polls/<id>, /join/<code>, /reset-password.
++// main.jsx decides which screen each path shows.
+ export function navigate(path, { replace = false } = {}) {
+   if (path === window.location.pathname) return;
+   window.history[replace ? 'replaceState' : 'pushState'](null, '', path);
+diff --git a/docs/architecture.md b/docs/architecture.md
+new file mode 100644
+index 0000000..7c7e244
+--- /dev/null
++++ b/docs/architecture.md
+@@ -0,0 +1,149 @@
++# Architecture
++
++## The big picture
++
++There are three parts: a React app in the browser, a small Express API, and Supabase.
++
++```mermaid
++flowchart LR
++  subgraph Browser["Browser: React app (client/)"]
++    UI["Screens"]
++    SJ["supabase-js"]
++  end
++  subgraph Server["Express API (server/)"]
++    MW["requireAuth"]
++    R["/api/me, /api/groups"]
++  end
++  subgraph Supabase
++    AUTH["Auth"]
++    REST["Data API (PostgREST)"]
++    RT["Realtime"]
++    PG[("Postgres + row level security")]
++  end
++
++  UI -- "sign up / sign in" --> SJ --> AUTH
++  UI -- "profile and groups: fetch /api/... with the access token" --> MW --> R
++  R -- "same token forwarded" --> REST
++  UI -- "polls, options, votes" --> SJ --> REST
++  RT -- "change events over a WebSocket" --> SJ
++  REST --> PG
++  AUTH --> PG
++  PG --> RT
++```
++
++The important idea: **Postgres is the security boundary.** Every query, whether it comes from Express or straight from the browser, runs as the signed-in user, and row level security (RLS) decides which rows that user can see or change. Neither the browser nor Express holds a key that can bypass RLS.
++
++## Two ways the app talks to the database
++
++| | Profile and groups | Polls, options and votes |
++| --- | --- | --- |
++| Path | Browser → Express `/api` → Supabase | Browser → Supabase directly |
++| Client code | `client/src/api.js` | `client/src/polls/repository.js` |
++| Why | Express validates input, shapes responses and maps database errors to friendly messages | Poll screens need Realtime, which is a WebSocket between the browser and Supabase, so they read and write there too |
++| Who enforces access | RLS (Express forwards the user's token) | RLS |
++
++Both are safe for the same reason: the user's token is what Supabase checks. Express adds convenience, not security.
++
++## A request, step by step
++
++**Creating a group** (through Express):
++
++1. The user submits the form in `Groups.jsx`, which calls `api('/groups', { method: 'POST', body: { name } })`.
++2. `api.js` gets the current access token from `supabase.auth.getSession()` and sends it as `Authorization: Bearer <token>`.
++3. Vite proxies `/api` to Express. `requireAuth` (`server/auth.js`) verifies the token and attaches `req.user` and `req.supabase`, a Supabase client that carries that token.
++4. `routes/groups.js` checks the name and runs `req.supabase.from('groups').insert({ name })`.
++5. In Postgres, `created_by` defaults to `auth.uid()`, the insert policy checks it is the caller, and the `groups_add_creator` trigger adds the creator to `group_members` as `admin`.
++6. Express returns the new group; the browser navigates to `/groups/<id>`.
++
++**Voting** (direct to Supabase):
++
++1. `PollPage` calls `repository.vote(pollId, optionId)`, which calls the `cast_vote` database function.
++2. `cast_vote` locks the poll row, checks the caller is a member, the poll is open and the option belongs to the poll, then inserts or updates the vote.
++3. Postgres publishes the change. Supabase Realtime sends it to every subscribed browser whose user is allowed to read that row.
++4. Each browser treats the event as "something changed" and re-reads the poll snapshot (`live.js`), so everyone sees counts that came from the database, not from adding up events.
++
++## Where things live
++
++```
++client/                     React app (Vite)
++  src/main.jsx              App shell: picks a screen from the URL and session; handles invite links
++  src/router.js             Tiny client-side router (navigate, usePath, inviteLink)
++  src/supabase.js           The one Supabase client for the browser
++  src/session.jsx           React context that tracks the Auth session
++  src/api.js                fetch wrapper for the Express API (adds the access token)
++  src/AuthScreen.jsx        Sign in, sign up, password reset
++  src/Groups.jsx            Group list, create/join, group page (members, invite link)
++  src/polls/Polls.jsx       Poll list for a group and the live poll page
++  src/polls/repository.js   All poll reads/writes and the Realtime subscription
++  src/polls/live.js         Keeps a poll snapshot fresh; recovers from missed events
++  src/styles.css            All styles
++
++server/                     Express API
++  index.js                  Starts the server
++  app.js                    Routes, health check, serves the built frontend in production
++  auth.js                   requireAuth middleware (verifies Supabase access tokens)
++  supabase.js               Creates Supabase clients (one for verifying, one per request)
++  errors.js                 Maps database errors to HTTP statuses and messages
++  routes/me.js              GET/PATCH the signed-in user's profile
++  routes/groups.js          Groups: list, create, join, rename, delete, members, invite link
++
++supabase/
++  config.toml               Local Supabase settings (ports, auth options)
++  migrations/               The database schema, in order. See docs/database.md
++
++tests/
++  polls/*.test.js           Unit tests for repository.js and live.js
++  polls/realtime.integration.js   Real Realtime test (local Supabase)
++  rls-attacks.test.js       Security and voting tests (local Supabase)
++  browser/                  Playwright tests with a fake data source
++
++benchmarks/                 The three performance experiments
++```
++
++## Screens and routes
++
++Routing is a few regular expressions in `client/src/main.jsx`:
++
++| Path | Screen |
++| --- | --- |
++| `/` | Your groups, create a group, join a group |
++| `/groups/<id>` | Members, invite link, the group's polls |
++| `/polls/<id>` | One poll: live results, vote, suggest, close |
++| `/join/<code>` | Remembers the invite, signs you in if needed, joins, then opens the group |
++| `/reset-password` | Choose a new password after opening a reset email |
++
++Signed-out users always see the sign-in screen. An invite code is kept in `localStorage` so it survives sign-up and the email confirmation round trip.
++
++## Express API
++
++Every route except `/api/health` requires `Authorization: Bearer <access token>`.
++
++| Method and path | Purpose | Notes |
++| --- | --- | --- |
++| `GET /api/health` | Is the API up and can it reach Supabase? | No sign-in needed |
++| `GET /api/me` | The signed-in user's profile | |
++| `PATCH /api/me` | Change `username` and/or `display_name` | Max 60 characters each |
++| `GET /api/groups` | Groups I belong to, with my role and member count | |
++| `POST /api/groups` | Create a group (`{ name }`) | I become its admin |
++| `POST /api/groups/join` | Join with an invite code or a full link (`{ code }`) | |
++| `GET /api/groups/:id` | One group with its members | 404 if I am not a member |
++| `PATCH /api/groups/:id` | Rename | Admins only |
++| `DELETE /api/groups/:id` | Delete the group and everything in it | Admins only |
++| `POST /api/groups/:id/invite` | Replace the invite code | Admins only; old links stop working |
++| `DELETE /api/groups/:id/members/:userId` | Remove a member; `me` leaves the group | Admins can remove others |
++
++Errors come back as `{ "error": "message for the user", "code": "database error code" }`. `server/errors.js` holds the mapping.
++
++## Design decisions worth knowing
++
++- **Express never uses the secret key.** It verifies the user's token and forwards it, so a bug in a route cannot leak another group's data: Postgres would refuse.
++- **Routes do not check membership themselves.** They ask for the row; RLS returns nothing if you are not allowed, and the route turns that into 404 or 403.
++- **Votes are written only through `cast_vote`.** Direct inserts and updates on `votes` are revoked, which is what makes "no vote counts after the poll closes" a guarantee instead of a hope.
++- **The winner is chosen in the database** by `close_poll` and saved on the poll. The UI only displays `saved_outcome_option_id`.
++- **Realtime events are signals, not data.** The UI re-reads a full snapshot instead of trusting event payloads, which keeps counts correct after reconnects, missed events and deletes.
++
++## Known limitations
++
++- Polls cannot be deleted or reopened from the UI (the database allows the creator or a group admin to delete one).
++- If a group's only admin leaves, nobody can rename, delete or re-key the group.
++- There is no profile screen: `PATCH /api/me` exists, but nothing in the UI calls it yet.
+diff --git a/docs/bingrui-handoff.md b/docs/bingrui-handoff.md
+index d3c4af5..60d970c 100644
+--- a/docs/bingrui-handoff.md
++++ b/docs/bingrui-handoff.md
+@@ -1,5 +1,12 @@
+ # Bingrui: tasks 1 and 6
+ 
++> This is the handoff note written when tasks 1 and 6 were delivered (Nov 18), kept as a
++> record of that work. Statements about what was pending or unverified describe that
++> date: all branches are now merged, and the tests and benchmarks below have since been
++> run against local Supabase. For the current state of the project see
++> [architecture.md](architecture.md), [supabase.md](supabase.md) and
++> [development.md](development.md).
++
+ ## Baseline and ownership
+ 
+ This branch starts at Albion's existing `albi` commit
+diff --git a/docs/database.md b/docs/database.md
+new file mode 100644
+index 0000000..88ca387
+--- /dev/null
++++ b/docs/database.md
+@@ -0,0 +1,179 @@
++# Database reference
++
++Everything here is defined in `supabase/migrations/`. For the ideas behind it (what RLS is, why some actions are functions), read [supabase.md](supabase.md) first.
++
++## Tables
++
++```mermaid
++erDiagram
++  auth_users ||--|| profiles : "trigger creates"
++  profiles ||--o{ groups : "created_by"
++  profiles ||--o{ group_members : "user_id"
++  groups ||--o{ group_members : "group_id"
++  groups ||--o{ polls : "group_id"
++  profiles ||--o{ polls : "created_by"
++  polls ||--o{ options : "poll_id"
++  polls ||--o{ votes : "poll_id"
++  options ||--o{ votes : "option_id"
++  profiles ||--o{ votes : "user_id"
++  polls }o--o| options : "saved_outcome_option_id"
++```
++
++`auth.users` belongs to Supabase Auth. Everything else is in the `public` schema.
++
++### `profiles`
++
++One row per user, created by the `on_auth_user_created` trigger when someone signs up.
++
++| Column | Type | Notes |
++| --- | --- | --- |
++| `id` | uuid, primary key | Same id as `auth.users`; deleted with the auth user |
++| `username` | text, unique | May be empty |
++| `display_name` | text | |
++| `created_at` | timestamptz | |
++
++### `groups`
++
++| Column | Type | Notes |
++| --- | --- | --- |
++| `id` | uuid, primary key | |
++| `name` | text | Cannot be blank |
++| `created_by` | uuid → `profiles` | Defaults to `auth.uid()`. A user who created a group cannot be deleted until the group is |
++| `invite_code` | text, unique | 32 random hex characters, generated by the database |
++| `created_at` | timestamptz | |
++
++Inserting a group fires the `groups_add_creator` trigger, which adds the creator to `group_members` as `admin`.
++
++### `group_members`
++
++| Column | Type | Notes |
++| --- | --- | --- |
++| `group_id` | uuid → `groups` | Primary key together with `user_id`; deleted with the group |
++| `user_id` | uuid → `profiles` | |
++| `role` | text | `admin` or `member` |
++| `joined_at` | timestamptz | |
++
++### `polls`
++
++| Column | Type | Notes |
++| --- | --- | --- |
++| `id` | uuid, primary key | |
++| `group_id` | uuid → `groups` | Deleted with the group |
++| `created_by` | uuid → `profiles` | Defaults to `auth.uid()` |
++| `question` | text | Cannot be blank |
++| `status` | text | `open` or `closed` |
++| `saved_outcome_option_id` | uuid → `options` | The winner, set by `close_poll()`. Null while open, or if nobody voted. Must be an option of this same poll |
++| `created_at` | timestamptz | |
++
++### `options`
++
++A restaurant suggested in a poll.
++
++| Column | Type | Notes |
++| --- | --- | --- |
++| `id` | uuid, primary key | |
++| `poll_id` | uuid → `polls` | Deleted with the poll |
++| `restaurant_name` | text | Cannot be blank |
++| `price_range` | text | Optional (`$` to `$$$$` in the UI) |
++| `food_category` | text | Optional |
++| `created_at` | timestamptz | Used to break ties |
++
++### `votes`
++
++| Column | Type | Notes |
++| --- | --- | --- |
++| `id` | uuid, primary key | |
++| `poll_id`, `option_id` | uuid → `options (poll_id, id)` | The pair is one foreign key, so a vote can only point at an option of its own poll |
++| `user_id` | uuid → `profiles` | Defaults to `auth.uid()` |
++| `created_at` | timestamptz | Updated when the vote changes |
++
++`unique (poll_id, user_id)` enforces one vote per person per poll. Changing your vote updates the row.
++
++## Rules the database enforces by itself
++
++These hold no matter what any client sends:
++
++- One vote per user per poll (`votes_one_per_user_per_poll`).
++- A vote's option belongs to the vote's poll (`votes_option_must_belong_to_poll_fk`).
++- A poll's saved winner is one of its own options (`polls_saved_outcome_belongs_to_poll_fk`).
++- Names and questions are not blank; `role` and `status` hold only their allowed values.
++- A group's creator is always a member with role `admin` at creation.
++- No vote is inserted or changed after a poll is closed (`cast_vote` and `close_poll` lock the poll row).
++
++## Grants
++
++What the `authenticated` role may do at all, before policies are considered. `anon` has no privileges.
++
++| Table | Select | Insert (columns) | Update (columns) | Delete |
++| --- | --- | --- | --- | --- |
++| `profiles` | yes | no | `username`, `display_name` | no |
++| `groups` | yes | `name` | `name` | yes |
++| `group_members` | yes | no | no | yes |
++| `polls` | yes | `group_id`, `question` | no | yes |
++| `options` | yes | `poll_id`, `restaurant_name`, `price_range`, `food_category` | no | no |
++| `votes` | yes | no | no | no |
++
++## Policies
++
++All policies apply to the `authenticated` role.
++
++| Table | Policy | Command | Allowed when |
++| --- | --- | --- | --- |
++| `profiles` | read self and group peers | select | It is you, or you share a group |
++| `profiles` | update self | update | It is you |
++| `groups` | members read | select | You are a member, or you created it |
++| `groups` | create as self | insert | `created_by` is you |
++| `groups` | admins update | update | You are an admin of it |
++| `groups` | admins delete | delete | You are an admin of it |
++| `group_members` | members read roster | select | The row's group is one of yours |
++| `group_members` | leave or admin removes | delete | The row is yours, or you are an admin of the group |
++| `polls` | members read | select | The poll's group is one of yours |
++| `polls` | members create | insert | `created_by` is you and the group is one of yours |
++| `polls` | creator or admin deletes | delete | You created it, or you are an admin of its group |
++| `options` | members read | select | The option's poll is in one of your groups |
++| `options` | members suggest while open | insert | The poll is open and in one of your groups |
++| `votes` | members read | select | The vote's poll is in one of your groups |
++
++`votes` also has insert, update and delete policies ("cast own while open", "change own while open", "remove own while open") from the original design. They no longer have any effect, because the voting migration revoked those grants so that every vote goes through `cast_vote()`.
++
++"Members read" on `groups` includes the creator because `insert ... returning` checks the read policy before the trigger has added the membership row.
++
++## Functions
++
++### Callable through the API
++
++| Function | Returns | Rules | Errors |
++| --- | --- | --- | --- |
++| `join_group(p_invite_code text)` | group id | Signed in. Joining twice is harmless | `P0002` unknown code |
++| `rotate_group_invite(p_group_id uuid)` | new code | Group admin | `42501` not an admin |
++| `cast_vote(p_poll_id uuid, p_option_id uuid)` | nothing | Member of the poll's group; poll open; option belongs to poll. Inserts or changes your vote | `P0002` no such poll, `42501` not a member, `55000` poll closed, `22023` wrong option |
++| `close_poll(p_poll_id uuid)` | winning option id or null | Poll creator. Closing an already closed poll returns the saved winner | `P0002` no such poll, `42501` not the creator |
++| `get_vote_totals(p_poll_id uuid)` | `option_id`, `restaurant_name`, `vote_count` per option | Member of the poll's group | `42501` otherwise |
++
++**How the winner is chosen:** most votes; ties go to the option suggested first (`created_at`), then to the smaller id. If nobody voted, there is no winner and `saved_outcome_option_id` stays null.
++
++### Internal
++
++| Function | Purpose |
++| --- | --- |
++| `public.handle_new_user()` | Trigger function: creates the `profiles` row on sign-up |
++| `private.add_group_creator()` | Trigger function: makes a group's creator its admin |
++| `private.my_group_ids()` | Group ids the caller belongs to |
++| `private.my_poll_ids()` | Poll ids in the caller's groups |
++| `private.my_peer_ids()` | User ids that share a group with the caller |
++| `private.is_group_admin(group_id)` | Is the caller an admin of this group? |
++| `private.is_open_poll_in_my_group(poll_id)` | Is this poll open and in one of the caller's groups? |
++
++## Indexes
++
++Besides primary keys and unique constraints:
++
++| Index | Supports |
++| --- | --- |
++| `group_members_user_id_idx (user_id, group_id)` | "Which groups am I in?", used by almost every policy |
++| `polls_group_id_idx (group_id)` | Listing a group's polls |
++| `votes_poll_option_idx (poll_id, option_id) include (id)` | Counting votes per option |
++
++## Realtime
++
++`polls`, `options` and `votes` are in the `supabase_realtime` publication. `groups`, `group_members` and `profiles` are not, so the group screens do not update live.
+diff --git a/docs/development.md b/docs/development.md
+new file mode 100644
+index 0000000..e2cd426
+--- /dev/null
++++ b/docs/development.md
+@@ -0,0 +1,190 @@
++# Development guide
++
++## Requirements
++
++- **Node.js 24** (`.nvmrc`; `nvm use` picks it up).
++- **Docker**, running, for local Supabase.
++
++Install dependencies once from the repository root. This installs the client and server workspaces too:
++
++```bash
++npm ci
++```
++
++## Environment files
++
++None of these are committed. Each has an example next to it.
++
++| File | Used by | Contains |
++| --- | --- | --- |
++| `client/.env` | Vite / the browser | `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY` |
++| `server/.env` | Express | `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `PORT` |
++| `.env.test` | Tests and benchmarks | Local `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, `DATABASE_URL` |
++
++`client/.env` and `server/.env` must point at the **same** project. Restart `npm run dev` after changing either.
++
++## Running locally
++
++Start Supabase. The first run downloads several Docker images and takes a few minutes:
++
++```bash
++npm run db -- start
++```
++
++Print the URL and keys whenever you need them:
++
++```bash
++npm run db -- status
++```
++
++Put the **API URL** and **publishable key** into `client/.env` and `server/.env`, then:
++
++```bash
++npm run dev
++```
++
++| URL | What |
++| --- | --- |
++| [http://localhost:5173](http://localhost:5173) | The app |
++| [http://localhost:3000/api/health](http://localhost:3000/api/health) | API status and whether it can reach Supabase |
++| [http://127.0.0.1:54323](http://127.0.0.1:54323) | Supabase Studio (browse tables, run SQL, manage users) |
++| [http://127.0.0.1:54324](http://127.0.0.1:54324) | Mail catcher for confirmation and password-reset emails |
++
++Local sign-up needs no email confirmation, so you can create test accounts with any address. To try the app as two people, use a second browser or a private window.
++
++Wipe the local database and re-run every migration (all local accounts and data are deleted):
++
++```bash
++npm run db -- db reset
++```
++
++Stop the containers, keeping the data for next time:
++
++```bash
++npm run db -- stop
++```
++
++## Using the hosted project
++
++Use this when you want everyone to share the same data, or you cannot run Docker.
++
++1. In the Supabase dashboard open **Connect** (or **Project Settings → API Keys**) and copy the project URL and the publishable key into `client/.env` and `server/.env`.
++2. Make sure the hosted database has every migration. See [Applying migrations to the hosted project](supabase.md#applying-migrations-to-the-hosted-project). **If the app signs you in but cannot create a group, this step was skipped.**
++3. In **Authentication → URL Configuration**, the Site URL and redirect URLs must include the address you open the app at (for development, `http://localhost:5173`), or confirmation and reset links will not come back to the app.
++
++Do not run the tests or benchmarks against the hosted project. They create and delete users, and the benchmarks refuse to run against anything but localhost.
++
++## Production build
++
++```bash
++npm run build
++```
++
++```bash
++npm start
++```
++
++Express then serves the built frontend from `client/dist` together with the API on one port (`PORT`, default 3000).
++
++## Tests
++
++| Command | Needs | What it checks |
++| --- | --- | --- |
++| `npm test` | Nothing | `repository.js` and `live.js`: the RPC contract, snapshot ordering, reconnect and cleanup |
++| `npm run test:browser` | Chromium (`npx playwright install chromium`) | The poll screens in a real browser with a fake data source: two users voting, reconnecting, closing, mobile layout |
++| `npm run test:rls` | Local Supabase + `.env.test` | Row level security as an outsider and as a member, voting rules (ties, no votes, vote racing a close), and that Express rejects bad tokens |
++| `npm run test:realtime` | Local Supabase + `.env.test` | A real Realtime event reaches a second signed-in user |
++
++Set up `.env.test` once:
++
++```bash
++cp .env.test.example .env.test
++```
++
++Fill in the publishable key and secret key from `npm run db -- status`. Tests create their own users and groups and delete them afterwards.
++
++The browser tests do not touch Supabase. They prove the screens behave; `test:rls` and `test:realtime` prove the database does.
++
++## Benchmarks
++
++All three run only against local Supabase and write to `benchmarks/results/` (git-ignored; copy results into the report if you need them kept).
++
++| Command | Question it answers |
++| --- | --- |
++| `npm run bench:rls` | What does row level security cost compared with hand-written membership checks, at 50, 500 and 5,000 groups? |
++| `npm run bench:voting` | How long does the vote-total query take with and without `votes_poll_option_idx`, at 1,000, 10,000 and 50,000 votes? |
++| `npm run bench:realtime` | How long from a vote until other users see it, with Realtime versus polling, for 1 to 50 watchers? |
++
++Options are documented at the top of each script and in [task5-voting-performance.md](task5-voting-performance.md) and [bingrui-handoff.md](bingrui-handoff.md).
++
++## Continuous integration
++
++`.github/workflows/ci.yml` runs on every push and pull request:
++
++- **frontend**: `npm test`, `npm run build`, `npm run test:browser`.
++- **supabase**: starts local Supabase (which applies every migration to an empty database), then `npm run test:rls` and `npm run test:realtime`.
++
++A migration that only works on top of someone's hand-edited database will fail the second job. That is the point.
++
++## Troubleshooting
++
++### I can sign in, but creating a group fails
++
++The database you are connected to does not match the code. There are two causes, and both are fixed by applying the latest migrations.
++
++**1. Migrations were never pushed to the hosted project.** The API answers with status 503 and "The database does not match this version of the app", and the Express log shows a line starting `Database schema mismatch`. Check what the hosted database has:
++
++```bash
++npx supabase migration list
++```
++
++Every row should have a timestamp in both the Local and Remote columns. If Remote is empty for some, follow [Applying migrations to the hosted project](supabase.md#applying-migrations-to-the-hosted-project).
++
++**2. Your account has no profile row.** The API answers with status 409 and "Your account has no profile yet". Every group, membership, poll and vote points at `public.profiles`, and that row is created by a trigger at sign-up. Accounts made before the trigger existed do not have one. The migration `20261124000000_backfill_profiles.sql` creates the missing rows, so pushing migrations fixes this too.
++
++To check either by hand, run this in the dashboard's SQL Editor:
++
++```sql
++-- Which migrations has this database run?
++select version from supabase_migrations.schema_migrations order by 1;
++
++-- Auth users without a profile (should return no rows).
++select u.id, u.email
++from auth.users u
++where not exists (select 1 from public.profiles p where p.id = u.id);
++```
++
++Locally, the fix for both is `npm run db -- db reset`.
++
++### The page says to add `VITE_SUPABASE_URL` …
++
++`client/.env` is missing or still has the placeholder key. Fill it in and restart `npm run dev` (Vite only reads `.env` at startup).
++
++### `/api/health` says `"supabase": "not_configured"` or `"unavailable"`
++
++- `not_configured`: `server/.env` is missing or has the placeholder key.
++- `unavailable`: the URL is wrong, or local Supabase is not running (`npm run db -- start`).
++
++### Every API call returns 401 and I get signed out
++
++The browser and Express are pointed at different Supabase projects, so Express cannot verify the token the browser got. Make `client/.env` and `server/.env` match.
++
++### Sign-up says "That username is already taken"
++
++Usernames are unique. Also shown if the profile trigger fails for any other reason; the Auth logs in the dashboard have the real error.
++
++### Sign-up works but I am not signed in
++
++Email confirmation is on in the hosted project. Open the link in the confirmation email, or confirm the user under **Authentication → Users**.
++
++### The poll page says "Reconnecting" and never "Live updates"
++
++Realtime is not delivering database changes. The page still updates every 5 seconds by re-reading. Check that the Realtime migration was applied (`20261118000000`), and in the dashboard under **Database → Publications** that `supabase_realtime` includes `polls`, `options` and `votes`.
++
++### `npm run db -- start` fails
++
++Docker is not running, or ports 54321 to 54324 are in use (often another Supabase project: run `npx supabase stop --all`).
++
++### A test fails with "Set local Supabase credentials"
++
++`.env.test` is missing. See [Tests](#tests).
+diff --git a/docs/Group22_ProjectProposal (1) (2).pdf b/docs/project-proposal.pdf
+similarity index 100%
+rename from docs/Group22_ProjectProposal (1) (2).pdf
+rename to docs/project-proposal.pdf
+diff --git a/docs/supabase.md b/docs/supabase.md
+new file mode 100644
+index 0000000..e956fcd
+--- /dev/null
++++ b/docs/supabase.md
+@@ -0,0 +1,182 @@
++# How we use Supabase
++
++Supabase is a hosted Postgres database with services built around it. We use four of them:
++
++| Service | What it is | What we use it for |
++| --- | --- | --- |
++| **Postgres** | The database | Tables, constraints, triggers, functions, row level security |
++| **Auth** | User accounts and sessions | Email + password sign-up and sign-in, password reset, access tokens |
++| **Data API** (PostgREST) | An HTTP API generated from the database | Every read and write: `supabase.from('table')...` and `supabase.rpc('function')` |
++| **Realtime** | Database changes pushed over a WebSocket | Live poll updates |
++
++We do not use Storage, Edge Functions or the GraphQL API.
++
++## Projects: local and hosted
++
++- **Local Supabase** runs on your machine in Docker (`npm run db -- start`). It is rebuilt from `supabase/migrations/`, so it is always exactly what the repository says. Tests and benchmarks run only against local.
++- **The hosted project** is the shared database on supabase.com. It only changes when someone pushes migrations to it (`npx supabase db push`).
++
++Which one the app uses depends only on the URL and key in `client/.env` and `server/.env`.
++
++## Keys
++
++| Key | Where it goes | What it can do |
++| --- | --- | --- |
++| **Publishable key** (`sb_publishable_…`; older projects call it the anon key) | `client/.env`, `server/.env`, `.env.test` | Identifies the project. On its own it can do nothing: the `anon` role has no table privileges. With a user's access token it can do what that user is allowed to do. Safe to ship to the browser. |
++| **Secret key** (`sb_secret_…`; older projects call it the service role key) | `.env.test` only, and only for **local** Supabase | Bypasses row level security completely. The tests use it to create and delete test users. The app never uses it. |
++
++Never put the secret key in `client/.env` or `server/.env`, and never commit any `.env` file (they are git-ignored).
++
++## Sign-in (Supabase Auth)
++
++1. **Sign up.** `AuthScreen.jsx` calls `supabase.auth.signUp()` with the email, password and, as metadata, a username and display name.
++2. **Profile row.** Auth stores the user in its own table, `auth.users`. Our trigger `on_auth_user_created` copies the id, username and display name into `public.profiles`, the table the rest of the schema references.
++3. **Session.** Auth returns an access token (a JWT that expires after an hour) and a refresh token. supabase-js keeps them in `localStorage` and refreshes the access token automatically.
++4. **React.** `session.jsx` listens to `supabase.auth.onAuthStateChange` and puts the session in context. `main.jsx` shows the sign-in screen when there is none.
++5. **Password reset.** `resetPasswordForEmail()` emails a link to `/reset-password`; opening it fires a `PASSWORD_RECOVERY` event and the app asks for a new password.
++
++If email confirmation is turned on in the project (it is off locally, see `supabase/config.toml`), sign-up returns no session until the user opens the link in the email.
++
++### How Express knows who you are
++
++Express does not have its own login. `client/src/api.js` sends the Supabase access token with every request, and `server/auth.js`:
++
++1. Verifies the token with `supabase.auth.getClaims(token)`. This checks the signature and expiry, either locally against the project's public signing keys or by asking Supabase Auth, depending on how the project signs tokens.
++2. Rejects anything missing, malformed, expired or forged with 401.
++3. Creates `req.supabase`, a Supabase client that sends the same token on every query.
++
++Because of step 3, the database sees the request as coming from that user. In SQL, `auth.uid()` returns their id.
++
++## Row level security (RLS)
++
++RLS is a Postgres feature: each table has policies, and every query is silently filtered by them. A policy is a condition such as "you can read a poll if you are a member of its group". With RLS, a query for a group you are not in does not fail with an error; it returns no rows, as if the group did not exist.
++
++Two layers must both allow an action:
++
++1. **Grants** decide which commands and columns a role can use at all. For example `authenticated` users can insert only the `name` column of `groups`, so a client cannot set `invite_code` or `created_at`.
++2. **Policies** decide which rows.
++
++Our rules in plain words:
++
++| Table | Read | Write |
++| --- | --- | --- |
++| `profiles` | Yourself and people who share a group with you | Update your own username and display name |
++| `groups` | Groups you belong to | Anyone signed in can create one (as themselves). Admins rename and delete |
++| `group_members` | The roster of your groups | No direct inserts: only the creator trigger and `join_group()`. You can leave; admins can remove members |
++| `polls` | Polls in your groups | Members create. Creator or a group admin deletes. No direct updates: closing goes through `close_poll()` |
++| `options` | Options of polls in your groups | Members add options while the poll is open |
++| `votes` | Votes in polls in your groups | No direct writes at all: only `cast_vote()` |
++
++Signed-out requests (the `anon` role) can do nothing.
++
++The policies call small helper functions in the `private` schema (`my_group_ids()`, `my_poll_ids()`, `my_peer_ids()`, `is_group_admin()`, `is_open_poll_in_my_group()`). The Data API does not expose that schema, so they cannot be called over HTTP. They exist so a policy on `group_members` can ask "is this user a member?" without recursing into itself, and so Postgres evaluates the membership list once per query instead of once per row.
++
++The full policy list is in [database.md](database.md). `tests/rls-attacks.test.js` proves the rules by attacking them as an outsider and as an ordinary member.
++
++## Database functions (RPC)
++
++Some actions are too sensitive or too multi-step for a plain insert, so they are Postgres functions, called with `supabase.rpc('name', { args })`:
++
++| Function | Called from | What it does |
++| --- | --- | --- |
++| `join_group(p_invite_code)` | Express `POST /api/groups/join` | Finds the group by invite code and adds you as a member. Needed because a non-member cannot see the group row at all |
++| `rotate_group_invite(p_group_id)` | Express `POST /api/groups/:id/invite` | Admin only. Replaces the invite code |
++| `cast_vote(p_poll_id, p_option_id)` | Browser, `repository.vote()` | Casts or changes your vote. Locks the poll row first |
++| `close_poll(p_poll_id)` | Browser, `repository.close()` | Creator only. Picks the winner, saves it and marks the poll closed. Locks the poll row first |
++| `get_vote_totals(p_poll_id)` | Browser, `repository.read()` | Vote count per option, for members |
++
++`cast_vote` and `close_poll` both lock the poll row before doing anything. That makes them take turns: a vote that gets the lock first is counted; a vote that arrives after the close sees a closed poll and is rejected. Without the lock, a vote could slip in between "count the votes" and "mark as closed".
++
++Most of these are `security definer`: they run with the privileges of the function's owner, not the caller, which lets them do things the caller has no grant for (like inserting into `group_members`). That is why each one checks `auth.uid()` and membership itself, and sets `search_path = ''` so it cannot be tricked into using a look-alike table.
++
++## Realtime
++
++`supabase/migrations/20261118000000_poll_realtime.sql` adds `polls`, `options` and `votes` to the `supabase_realtime` publication, which tells Postgres to stream changes on those tables.
++
++In the browser, `repository.observe(pollId, ...)` opens a channel and subscribes to "Postgres Changes" filtered to one poll (`poll_id=eq.<id>`). Realtime applies the same RLS read policies before sending an event, so you only receive changes to rows you could have selected.
++
++`live.js` wraps this so the page stays correct even when the connection is not:
++
++- It shows "Live updates" only after the server confirms the subscription.
++- Every event triggers a re-read of the whole poll rather than patching the screen from the event.
++- It re-reads when the connection comes back, when the tab becomes visible, every 5 seconds while not live, and every 30 seconds regardless.
++
++## Migrations
++
++The database schema is code. Each file in `supabase/migrations/` is a SQL script named `<timestamp>_<name>.sql`, and they run in timestamp order. Supabase records which ones have run in the table `supabase_migrations.schema_migrations`.
++
++| Migration | What it adds |
++| --- | --- |
++| `20261114000000_core_schema.sql` | The six tables, their constraints, and the profile-on-sign-up trigger |
++| `20261116000000_groups_and_rls.sql` | Invite codes, `join_group()`, `rotate_group_invite()`, grants and all RLS policies |
++| `20261118000000_poll_realtime.sql` | Publishes `polls`, `options`, `votes` to Realtime |
++| `20261119000000_voting_functions_and_indexes.sql` | `cast_vote()`, `close_poll()`, `get_vote_totals()`, the votes index; revokes direct vote writes |
++| `20261124000000_backfill_profiles.sql` | Gives every existing Auth user a profile row and re-asserts the sign-up trigger |
++
++### Changing the database
++
++1. Create a new file. Never edit a migration that has already been pushed: databases that ran the old version will not run it again.
++
++   ```bash
++   npm run db -- migration new describe_your_change
++   ```
++
++2. Write the SQL in the new file under `supabase/migrations/`.
++3. Rebuild your local database from scratch to prove the whole chain still works:
++
++   ```bash
++   npm run db -- db reset
++   ```
++
++4. Run the tests (`npm run test:rls`, `npm run test:realtime`).
++5. Commit the migration with the code that needs it.
++6. After it is merged, push it to the hosted project (next section) and tell the team.
++
++Things to remember when writing one:
++
++- A new table needs `alter table ... enable row level security`, grants and policies, or nobody can read it (or, worse, everyone can).
++- A new function needs `revoke all ... from public, anon` and `grant execute ... to authenticated`.
++- If the frontend should get live updates for a new table, add it to the `supabase_realtime` publication.
++
++### Applying migrations to the hosted project
++
++One time per machine, log in and link the repository to the project (the project ref is the id in the dashboard URL):
++
++```bash
++npx supabase login
++```
++
++```bash
++npx supabase link --project-ref YOUR_PROJECT_REF
++```
++
++See which migrations the hosted database has and which it is missing:
++
++```bash
++npx supabase migration list
++```
++
++The hosted project was created by hand before migrations existed, so it already contains the core schema. If the list shows `20261114000000` as not applied remotely, mark it as applied instead of running it (this only needs to be done once, by one person):
++
++```bash
++npx supabase migration repair --status applied 20261114000000
++```
++
++Then apply everything that is missing:
++
++```bash
++npx supabase db push
++```
++
++## The Supabase dashboard
++
++Useful places, in the hosted dashboard or local Studio ([http://127.0.0.1:54323](http://127.0.0.1:54323)):
++
++- **Table Editor**: browse and edit rows. It runs as the database owner, so it sees everything regardless of RLS.
++- **SQL Editor**: run SQL. Good for the checks in [development.md](development.md#troubleshooting).
++- **Authentication → Users**: see, confirm or delete accounts.
++- **Authentication → URL Configuration**: the Site URL and allowed redirect URLs. Confirmation and password-reset links only work for URLs listed here.
++- **Database → Policies**: every RLS policy per table.
++- **Project Settings → API Keys** (or the **Connect** button): the project URL and keys.
++
++Locally, emails that Auth "sends" (confirmations, password resets) are caught at [http://127.0.0.1:54324](http://127.0.0.1:54324).
+diff --git a/package.json b/package.json
+index 2fdb31a..fa84104 100644
+--- a/package.json
++++ b/package.json
+@@ -17,13 +17,13 @@
+     "build": "npm run build --workspace client",
+     "start": "npm run start --workspace server",
+     "db": "supabase",
+-    "test:rls": "node --env-file-if-exists=.env.test --test --test-reporter=spec \"tests/**/*.test.js\"",
++    "test": "node --test \"tests/polls/*.test.js\"",
++    "test:browser": "playwright test",
++    "test:rls": "node --env-file-if-exists=.env.test --test --test-reporter=spec tests/rls-attacks.test.js",
++    "test:realtime": "node --env-file-if-exists=.env.test --test tests/polls/realtime.integration.js",
+     "bench:rls": "node --env-file-if-exists=.env.test benchmarks/rls-cost.js",
+     "bench:voting": "node --env-file-if-exists=.env.test benchmarks/voting-performance.js",
+-    "test": "node --test tests/polls/*.test.js",
+-    "test:browser": "playwright test",
+-    "bench:realtime": "node --env-file-if-exists=.env.test benchmarks/realtime.js",
+-    "test:realtime": "node --env-file-if-exists=.env.test --test tests/polls/realtime.integration.js"
++    "bench:realtime": "node --env-file-if-exists=.env.test benchmarks/realtime.js"
+   },
+   "devDependencies": {
+     "@playwright/test": "^1.65.1",
+diff --git a/server/errors.js b/server/errors.js
+index e7ed097..4a28953 100644
+--- a/server/errors.js
++++ b/server/errors.js
+@@ -10,6 +10,22 @@ const statusByCode = {
+   '22P02': 400, // invalid input syntax, e.g. a malformed uuid
+ };
+ 
++// The query names a table, column or function the database does not have: the
++// project is missing migrations (or has newer ones than this code expects).
++const schemaMismatchCodes = new Set([
++  '42P01', // undefined table
++  '42703', // undefined column
++  '42883', // undefined function
++  'PGRST200', // no relationship between the embedded tables
++  'PGRST202', // function not in PostgREST's schema cache
++  'PGRST204', // column not in PostgREST's schema cache
++  'PGRST205', // table not in PostgREST's schema cache
++]);
++
++export const schemaMismatchMessage =
++  'The database does not match this version of the app. Apply the latest migrations '
++  + '(see docs/development.md, "Troubleshooting"), then try again.';
++
+ function messageFor(error, status) {
+   switch (error?.code) {
+     case '42501':
+@@ -23,12 +39,24 @@ function messageFor(error, status) {
+       return 'Not found.';
+     case '23505':
+       return 'That value is already taken.';
++    case '23503':
++      // Every user-owned row points at public.profiles, so for a signed-in user this
++      // almost always means their own profile row is missing.
++      return `${error.message} ${error.details}`.includes('profiles')
++        ? 'Your account has no profile yet. Apply the latest database migrations '
++          + '(see docs/development.md, "Troubleshooting"), then try again.'
++        : 'That refers to something that no longer exists.';
+     default:
+       return status === 400 ? 'Check the values you entered.' : 'Something went wrong. Try again.';
+   }
+ }
+ 
+ export function sendSupabaseError(res, error) {
++  if (schemaMismatchCodes.has(error?.code)) {
++    console.error('Database schema mismatch (are all migrations applied?):', error);
++    return res.status(503).json({ error: schemaMismatchMessage, code: error.code });
++  }
++
+   const status = statusByCode[error?.code] ?? 500;
+   if (status === 500) console.error('Supabase error:', error);
+   return res.status(status).json({ error: messageFor(error, status), code: error?.code });
+diff --git a/supabase/migrations/20261124000000_backfill_profiles.sql b/supabase/migrations/20261124000000_backfill_profiles.sql
+new file mode 100644
+index 0000000..357361a
+--- /dev/null
++++ b/supabase/migrations/20261124000000_backfill_profiles.sql
+@@ -0,0 +1,72 @@
++-- Make sure every Supabase Auth user has a profile.
++--
++-- groups.created_by, polls.created_by, group_members.user_id and votes.user_id all
++-- reference public.profiles. A user without a profile row can sign in but cannot
++-- create or join a group: the insert fails its foreign key. That happens to accounts
++-- created before the on_auth_user_created trigger existed, and to every account if a
++-- project never got the trigger (the core schema migration is marked as applied on the
++-- hosted project instead of being run there).
++--
++-- This migration is safe to run more than once.
++
++-- 1. Re-assert the sign-up trigger, so the hosted project matches the repository.
++create or replace function public.handle_new_user() returns trigger
++language plpgsql security definer set search_path = '' as $$
++begin
++  insert into public.profiles (id, username, display_name)
++  values (
++    new.id,
++    nullif(new.raw_user_meta_data ->> 'username', ''),
++    coalesce(
++      nullif(new.raw_user_meta_data ->> 'display_name', ''),
++      nullif(new.raw_user_meta_data ->> 'full_name', ''),
++      nullif(new.raw_user_meta_data ->> 'name', '')
++    )
++  )
++  on conflict (id) do nothing;
++  return new;
++end;
++$$;
++
++do $$
++begin
++  if not exists (
++    select 1 from pg_trigger
++    where tgname = 'on_auth_user_created' and tgrelid = 'auth.users'::regclass
++  ) then
++    create trigger on_auth_user_created
++      after insert on auth.users
++      for each row execute function public.handle_new_user();
++  end if;
++end;
++$$;
++
++-- 2. Create the missing profiles. A username is copied only if nobody has it yet
++--    (usernames are unique); otherwise it is left empty and the user can pick one.
++with missing as (
++  select
++    u.id,
++    nullif(u.raw_user_meta_data ->> 'username', '') as username,
++    coalesce(
++      nullif(u.raw_user_meta_data ->> 'display_name', ''),
++      nullif(u.raw_user_meta_data ->> 'full_name', ''),
++      nullif(u.raw_user_meta_data ->> 'name', '')
++    ) as display_name,
++    row_number() over (
++      partition by nullif(u.raw_user_meta_data ->> 'username', '')
++      order by u.created_at, u.id
++    ) as username_rank
++  from auth.users u
++  where not exists (select 1 from public.profiles p where p.id = u.id)
++)
++insert into public.profiles (id, username, display_name)
++select
++  m.id,
++  case
++    when m.username_rank = 1
++      and not exists (select 1 from public.profiles p where p.username = m.username)
++    then m.username
++  end,
++  m.display_name
++from missing m
++on conflict (id) do nothing;
+diff --git a/tests/rls-attacks.test.js b/tests/rls-attacks.test.js
+index d940502..afaa316 100644
+--- a/tests/rls-attacks.test.js
++++ b/tests/rls-attacks.test.js
+@@ -1,10 +1,11 @@
+-// "Attack" tests for task 4: call the Supabase Data API directly (not through Express)
+-// as different users and prove that row level security and table grants block every
+-// attempt to read or change another group's data.
++// "Attack" tests: call the Supabase Data API directly (not through Express) as different
++// users and prove that row level security and table grants block every attempt to read
++// or change another group's data. They also cover the voting functions (ties, closing
++// with no votes, a vote racing a close) and Express's token checks.
+ //
+ // Needs SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY and SUPABASE_SECRET_KEY in .env.test.
+-// The secret key is used only to create and delete the test users and to close a poll
+-// as an administrator would; every attack runs with the publishable key and a user token.
++// The secret key is used only to create and delete the test users and their groups;
++// every attack runs with the publishable key and a user token.
+ //
+ //   npm run test:rls
+ import assert from 'node:assert/strict';
+@@ -124,7 +125,7 @@ describe('row level security attacks', { skip: !configured && 'set SUPABASE_URL,
+     test('a member can read the poll, options, votes and other members\' profiles', async () => {
+       const { client } = users.bob;
+       assert.equal((await client.from('polls').select('id').eq('id', pollId)).data.length, 1);
+-      assert.equal((await client.from('options').select('id').eq('poll_id', pollId)).data.length, 1);
++      assert.equal((await client.from('options').select('id').eq('poll_id', pollId)).data.length, 2);
+       assert.equal((await client.from('votes').select('id').eq('poll_id', pollId)).data.length, 1);
+       assert.equal((await client.from('profiles').select('id').eq('id', users.alice.id)).data.length, 1);
+     });
+@@ -376,5 +377,20 @@ describe('row level security attacks', { skip: !configured && 'set SUPABASE_URL,
+       assert.equal((await get(`/groups/${groupId}`, users.mallory.token)).status, 404);
+       assert.equal((await get(`/groups/${groupId}`, users.bob.token)).status, 200);
+     });
++
++    test('explains a missing profile instead of failing with a generic error', async () => {
++      // Accounts created before the sign-up trigger existed have no profile row.
++      const orphan = await createUser('orphan');
++      users.orphan = orphan;
++      assert.ifError((await admin.from('profiles').delete().eq('id', orphan.id)).error);
++
++      const response = await fetch(`${base}/groups`, {
++        method: 'POST',
++        headers: { Authorization: `Bearer ${orphan.token}`, 'Content-Type': 'application/json' },
++        body: JSON.stringify({ name: 'No profile' }),
++      });
++      assert.equal(response.status, 409);
++      assert.match((await response.json()).error, /no profile yet/);
++    });
+   });
+ });
+-- 
+2.43.0
+

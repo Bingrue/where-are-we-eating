@@ -3,11 +3,17 @@ import { supabase } from './supabase.js';
 
 const usernamePattern = /^[a-z0-9_]{3,20}$/;
 
+const alreadyRegisteredMessage =
+  'An account with that email already exists. Sign in instead, or use "Forgot password?" to reset it.';
+
 // Supabase Auth reports a failure in our on_auth_user_created trigger as a generic
 // database error. The only constraint that trigger can break is the unique username.
 function describeAuthError(error) {
   if (/database error saving new user/i.test(error.message)) {
     return 'That username is already taken.';
+  }
+  if (error.code === 'user_already_exists' || error.code === 'email_exists') {
+    return alreadyRegisteredMessage;
   }
   if (error.code === 'over_email_send_rate_limit') {
     return 'Too many emails were sent. Wait a few minutes and try again.';
@@ -17,7 +23,9 @@ function describeAuthError(error) {
 
 export function AuthScreen({ invitePending }) {
   const [mode, setMode] = useState('sign-in');
-  const [form, setForm] = useState({ email: '', password: '', username: '', displayName: '' });
+  const [form, setForm] = useState({
+    email: '', password: '', confirmPassword: '', username: '', displayName: '',
+  });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -26,6 +34,7 @@ export function AuthScreen({ invitePending }) {
 
   function switchMode(next) {
     setMode(next);
+    setForm((previous) => ({ ...previous, password: '', confirmPassword: '' }));
     setError('');
     setNotice('');
   }
@@ -49,6 +58,9 @@ export function AuthScreen({ invitePending }) {
         if (!usernamePattern.test(username)) {
           throw new Error('Usernames are 3–20 lowercase letters, numbers or underscores.');
         }
+        if (form.password !== form.confirmPassword) {
+          throw new Error('The passwords do not match.');
+        }
         const { data, error: authError } = await supabase.auth.signUp({
           email: form.email,
           password: form.password,
@@ -61,6 +73,12 @@ export function AuthScreen({ invitePending }) {
           },
         });
         if (authError) throw authError;
+        // With email confirmation on, Supabase does not return an error for an email
+        // that is already registered (so attackers cannot probe for accounts). It
+        // returns a fake user with no identities instead, and sends no email.
+        if (data.user && data.user.identities?.length === 0) {
+          throw new Error(alreadyRegisteredMessage);
+        }
         if (!data.session) {
           // Email confirmation is on: Supabase sent a confirmation link.
           setNotice('Check your email and open the confirmation link to finish signing up.');
@@ -113,6 +131,13 @@ export function AuthScreen({ invitePending }) {
               autoComplete={mode === 'sign-up' ? 'new-password' : 'current-password'} />
           </label>
         )}
+        {mode === 'sign-up' && (
+          <label>
+            Confirm password
+            <input type="password" value={form.confirmPassword} onChange={update('confirmPassword')} required
+              minLength={6} autoComplete="new-password" />
+          </label>
+        )}
 
         {error && <p className="error" role="alert">{error}</p>}
         {notice && <p className="notice" role="status">{notice}</p>}
@@ -134,11 +159,16 @@ export function AuthScreen({ invitePending }) {
 // Shown after the user opens a password reset link (PASSWORD_RECOVERY event).
 export function NewPasswordScreen({ onDone }) {
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
   async function submit(event) {
     event.preventDefault();
+    if (password !== confirmPassword) {
+      setError('The passwords do not match.');
+      return;
+    }
     setBusy(true);
     setError('');
     const { error: authError } = await supabase.auth.updateUser({ password });
@@ -154,6 +184,11 @@ export function NewPasswordScreen({ onDone }) {
         <label>
           New password
           <input type="password" value={password} onChange={(event) => setPassword(event.target.value)}
+            required minLength={6} autoComplete="new-password" />
+        </label>
+        <label>
+          Confirm new password
+          <input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)}
             required minLength={6} autoComplete="new-password" />
         </label>
         {error && <p className="error" role="alert">{error}</p>}
