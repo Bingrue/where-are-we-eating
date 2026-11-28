@@ -82,6 +82,15 @@ export function createPollRepository(client) {
       await unwrap(db().rpc('close_poll', { p_poll_id: pollId }));
     },
 
+    // Subscribe to new and changed polls in one group. `changed` is called on every
+    // event (the caller re-reads the list). Returns a function that unsubscribes.
+    observeGroup(groupId, changed) {
+      const channel = db().channel(`group-polls:${groupId}:${crypto.randomUUID()}`)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'polls', filter: `group_id=eq.${groupId}` }, changed)
+        .subscribe();
+      return () => { void client.removeChannel(channel); };
+    },
+
     // Subscribe to Postgres Changes for one poll. `changed` is called whenever something
     // may have changed (the caller re-reads the snapshot); `status` reports 'live' or
     // 'reconnecting'. Returns a function that removes the subscription.

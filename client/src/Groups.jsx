@@ -2,7 +2,10 @@ import { useCallback, useEffect, useState } from 'react';
 import { api } from './api.js';
 import { GroupPolls } from './polls/Polls.jsx';
 import { inviteLink, navigate } from './router.js';
+import { useLiveRefresh } from './useLiveRefresh.js';
 
+// Load an API path, then keep it fresh in the background. A failed background reload
+// keeps showing the last good data instead of blanking the page.
 function useApi(path) {
   const [state, setState] = useState({ loading: true, data: null, error: '' });
 
@@ -11,15 +14,32 @@ function useApi(path) {
       const data = await api(path);
       setState({ loading: false, data, error: '' });
     } catch (error) {
-      setState({ loading: false, data: null, error: error.message });
+      setState((previous) => ({
+        loading: false,
+        data: previous.data,
+        error: previous.data ? '' : error.message,
+      }));
     }
   }, [path]);
 
   useEffect(() => {
+    setState({ loading: true, data: null, error: '' });
     reload();
   }, [reload]);
 
+  useLiveRefresh(reload);
+
   return { ...state, reload };
+}
+
+const initials = (name) => name.trim().split(/\s+/).slice(0, 2).map((word) => word[0]).join('').toUpperCase() || '?';
+
+function BackLink({ to, children }) {
+  return (
+    <a className="back" href={to} onClick={(event) => { event.preventDefault(); navigate(to); }}>
+      {children}
+    </a>
+  );
 }
 
 export function GroupsPage() {
@@ -61,27 +81,43 @@ export function GroupsPage() {
 
   return (
     <>
-      <section className="card">
-        <h2>Your groups</h2>
-        {groups.loading && <p>Loading…</p>}
-        {groups.error && <p className="error">{groups.error}</p>}
-        {groups.data?.length === 0 && <p className="muted">You are not in any groups yet. Create one or join with an invite link.</p>}
-        <ul className="list">
-          {groups.data?.map((group) => (
-            <li key={group.id}>
-              <a href={`/groups/${group.id}`} onClick={(event) => { event.preventDefault(); navigate(`/groups/${group.id}`); }}>
-                {group.name}
-              </a>
-              <span className="muted">
-                {group.member_count} {group.member_count === 1 ? 'member' : 'members'} · {group.my_role}
-              </span>
-            </li>
-          ))}
-        </ul>
+      <section className="page-intro">
+        <h2 className="display">Your groups</h2>
+        <p className="muted">Pick a group to see its polls, or start a new one.</p>
+      </section>
+
+      <section className="table">
+        {groups.loading && <p className="muted pad">Loading your groups…</p>}
+        {groups.error && <p className="error pad" role="alert">{groups.error}</p>}
+        {groups.data?.length === 0 && (
+          <p className="empty">You’re not in a group yet. Create one below, or paste an invite link a friend sent you.</p>
+        )}
+        {groups.data?.length > 0 && (
+          <ul className="rows">
+            {groups.data.map((group) => (
+              <li key={group.id}>
+                <a
+                  className="row-link"
+                  href={`/groups/${group.id}`}
+                  onClick={(event) => { event.preventDefault(); navigate(`/groups/${group.id}`); }}
+                >
+                  <span className="avatar" aria-hidden="true">{initials(group.name)}</span>
+                  <span className="row-main">
+                    <span className="row-title">{group.name}</span>
+                    <span className="muted small">
+                      {group.member_count} {group.member_count === 1 ? 'member' : 'members'}
+                    </span>
+                  </span>
+                  {group.my_role === 'admin' && <span className="chip">Admin</span>}
+                </a>
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
 
       <div className="columns">
-        <section className="card">
+        <section className="panel">
           <h3>Create a group</h3>
           <form onSubmit={createGroup} className="stack">
             <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Friday lunch crew"
@@ -89,12 +125,12 @@ export function GroupsPage() {
             <button type="submit" disabled={busy}>Create group</button>
           </form>
         </section>
-        <section className="card">
+        <section className="panel">
           <h3>Join a group</h3>
           <form onSubmit={joinGroup} className="stack">
             <input value={code} onChange={(event) => setCode(event.target.value)} placeholder="Paste an invite link"
               required aria-label="Invite link or code" />
-            <button type="submit" disabled={busy}>Join group</button>
+            <button type="submit" className="secondary" disabled={busy}>Join group</button>
           </form>
         </section>
       </div>
@@ -117,12 +153,12 @@ export function GroupPage({ groupId, userId }) {
     }
   }
 
-  if (group.loading) return <section className="card"><p>Loading…</p></section>;
+  if (group.loading) return <p className="muted">Loading group…</p>;
   if (group.error) {
     return (
-      <section className="card">
-        <p className="error">{group.error}</p>
-        <button type="button" className="link" onClick={() => navigate('/')}>Back to your groups</button>
+      <section className="table pad">
+        <p className="error" role="alert">{group.error}</p>
+        <BackLink to="/">← Your groups</BackLink>
       </section>
     );
   }
@@ -153,44 +189,62 @@ export function GroupPage({ groupId, userId }) {
 
   return (
     <>
-      <p><button type="button" className="link" onClick={() => navigate('/')}>← Your groups</button></p>
-      <section className="card">
-        <h2>{data.name}</h2>
-        <h3>Invite link</h3>
-        <p className="muted">Anyone with this link can join the group.</p>
-        <div className="row">
-          <input readOnly value={link} aria-label="Invite link" onFocus={(event) => event.target.select()} />
-          <button type="button" onClick={copyLink}>{copied ? 'Copied' : 'Copy'}</button>
-          {isAdmin && <button type="button" className="secondary" onClick={rotateLink}>New link</button>}
-        </div>
+      <BackLink to="/">← Your groups</BackLink>
+      <section className="page-intro">
+        <h2 className="display">{data.name}</h2>
+        <p className="muted">
+          {data.members.length} {data.members.length === 1 ? 'member' : 'members'}
+        </p>
       </section>
 
-      <section className="card">
-        <h3>Members</h3>
-        <ul className="list">
-          {data.members.map((member) => (
-            <li key={member.user_id}>
-              <span>
-                {member.profile?.display_name || member.profile?.username || 'Member'}
-                {member.profile?.username && <span className="muted"> @{member.profile.username}</span>}
-              </span>
-              <span className="row">
-                <span className="muted">{member.role}</span>
-                {member.user_id === userId && (
-                  <button type="button" className="link" onClick={() => removeMember(userId)}>Leave</button>
-                )}
-                {isAdmin && member.user_id !== userId && (
-                  <button type="button" className="link" onClick={() => removeMember(member.user_id)}>Remove</button>
-                )}
-              </span>
-            </li>
-          ))}
-        </ul>
-        {isAdmin && <button type="button" className="danger" onClick={deleteGroup}>Delete group</button>}
-      </section>
+      {error && <p className="error" role="alert">{error}</p>}
 
       <GroupPolls key={groupId} groupId={groupId} />
-      {error && <p className="error" role="alert">{error}</p>}
+
+      <div className="columns">
+        <section className="panel">
+          <h3>Members</h3>
+          <ul className="people">
+            {data.members.map((member) => {
+              const name = member.profile?.display_name || member.profile?.username || 'Member';
+              return (
+                <li key={member.user_id}>
+                  <span className="avatar small" aria-hidden="true">{initials(name)}</span>
+                  <span className="row-main">
+                    <span>
+                      {name}
+                      {member.user_id === userId && <span className="muted"> (you)</span>}
+                    </span>
+                    {member.profile?.username && <span className="muted small">@{member.profile.username}</span>}
+                  </span>
+                  {member.role === 'admin' && <span className="chip">Admin</span>}
+                  {member.user_id === userId && (
+                    <button type="button" className="link" onClick={() => removeMember(userId)}>Leave</button>
+                  )}
+                  {isAdmin && member.user_id !== userId && (
+                    <button type="button" className="link" onClick={() => removeMember(member.user_id)}>Remove</button>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+
+        <section className="panel">
+          <h3>Invite friends</h3>
+          <p className="muted small">Anyone with this link can join the group.</p>
+          <div className="stack">
+            <input readOnly value={link} aria-label="Invite link" onFocus={(event) => event.target.select()} />
+            <div className="row">
+              <button type="button" onClick={copyLink}>{copied ? 'Copied' : 'Copy link'}</button>
+              {isAdmin && <button type="button" className="secondary" onClick={rotateLink}>Make a new link</button>}
+            </div>
+          </div>
+          {isAdmin && (
+            <button type="button" className="danger" onClick={deleteGroup}>Delete group</button>
+          )}
+        </section>
+      </div>
     </>
   );
 }

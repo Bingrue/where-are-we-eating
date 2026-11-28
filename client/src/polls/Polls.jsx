@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { navigate } from '../router.js';
 import { supabase } from '../supabase.js';
+import { useLiveRefresh } from '../useLiveRefresh.js';
 import { watchPoll } from './live.js';
 import { createPollRepository } from './repository.js';
 
@@ -23,22 +24,37 @@ export function GroupPolls({ groupId, repository = defaultRepository }) {
   const [question, setQuestion] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const [reloadCount, setReloadCount] = useState(0);
+  const active = useRef(true);
+
+  // Re-read the list. Used on load, on Realtime events and in the background.
+  const reload = useCallback(async () => {
+    try {
+      const data = await repository.list(groupId);
+      if (!active.current) return;
+      setPolls(data);
+      setError('');
+    } catch (caught) {
+      if (active.current) setError(caught.message);
+    }
+  }, [groupId, repository]);
 
   useEffect(() => {
-    let active = true;
+    active.current = true;
     setPolls(null);
-    repository.list(groupId)
-      .then((data) => {
-        if (!active) return;
-        setPolls(data);
-        setError('');
-      })
-      .catch((caught) => {
-        if (active) setError(caught.message);
-      });
-    return () => { active = false; };
-  }, [groupId, repository, reloadCount]);
+    void reload();
+    let stop = () => {};
+    try {
+      stop = repository.observeGroup?.(groupId, () => void reload()) ?? stop;
+    } catch {
+      // Realtime unavailable: the background refresh below still picks up new polls.
+    }
+    return () => {
+      active.current = false;
+      stop();
+    };
+  }, [groupId, repository, reload]);
+
+  useLiveRefresh(reload);
 
   async function create(event) {
     event.preventDefault();
@@ -56,44 +72,50 @@ export function GroupPolls({ groupId, repository = defaultRepository }) {
   }
 
   return (
-    <section className="card">
-      <h2>Restaurant polls</h2>
-      {error && (
-        <p className="error" role="alert">
-          {error}{' '}
-          <button type="button" className="link" onClick={() => setReloadCount((count) => count + 1)}>Retry</button>
-        </p>
-      )}
-      {!polls && !error && <p role="status">Loading polls…</p>}
-      {polls?.length === 0 && <p className="muted">No polls yet. Start one to pick your next meal.</p>}
-
-      <ul className="list">
-        {polls?.map((poll) => (
-          <li key={poll.id}>
-            <a
-              href={`/polls/${poll.id}`}
-              onClick={(event) => { event.preventDefault(); navigate(`/polls/${poll.id}`); }}
-            >
-              {poll.question}
-            </a>
-            <span className="badge">{poll.status === 'open' ? 'Open' : 'Closed'}</span>
-          </li>
-        ))}
-      </ul>
-
-      <form className="stack poll-create" onSubmit={create}>
+    <section className="table">
+      <form className="poll-create" onSubmit={create}>
         <label>
           Poll question
-          <input
-            value={question}
-            onChange={(event) => setQuestion(event.target.value)}
-            required
-            maxLength={200}
-            placeholder="Where should we eat tonight?"
-          />
+          <span className="inline-form">
+            <input
+              value={question}
+              onChange={(event) => setQuestion(event.target.value)}
+              required
+              maxLength={200}
+              placeholder="Where should we eat tonight?"
+            />
+            <button type="submit" disabled={busy || !question.trim()}>{busy ? 'Creating…' : 'Create poll'}</button>
+          </span>
         </label>
-        <button type="submit" disabled={busy || !question.trim()}>{busy ? 'Creating…' : 'Create poll'}</button>
       </form>
+
+      {error && (
+        <p className="error pad" role="alert">
+          {error}{' '}
+          <button type="button" className="link" onClick={() => void reload()}>Retry</button>
+        </p>
+      )}
+      {!polls && !error && <p className="muted pad" role="status">Loading polls…</p>}
+      {polls?.length === 0 && <p className="empty">No polls yet. Ask the group a question above to start one.</p>}
+
+      {polls?.length > 0 && (
+        <ul className="rows">
+          {polls.map((poll) => (
+            <li key={poll.id}>
+              <a
+                className="row-link"
+                href={`/polls/${poll.id}`}
+                onClick={(event) => { event.preventDefault(); navigate(`/polls/${poll.id}`); }}
+              >
+                <span className="row-main row-title">{poll.question}</span>
+                <span className={`chip ${poll.status === 'open' ? 'open' : ''}`}>
+                  {poll.status === 'open' ? 'Voting open' : 'Closed'}
+                </span>
+              </a>
+            </li>
+          ))}
+        </ul>
+      )}
     </section>
   );
 }
@@ -157,7 +179,7 @@ export function PollPage({ pollId, userId, repository = defaultRepository }) {
 
   if (!snapshot) {
     return (
-      <section className="card">
+      <section className="table pad">
         {error ? (
           <>
             <p className="error" role="alert">{error}</p>
@@ -178,66 +200,76 @@ export function PollPage({ pollId, userId, repository = defaultRepository }) {
 
   return (
     <>
-      <p>
-        <button type="button" className="link" onClick={() => navigate(`/groups/${snapshot.group_id}`)}>
-          ← Back to group
-        </button>
-      </p>
+      <a
+        className="back"
+        href={`/groups/${snapshot.group_id}`}
+        onClick={(event) => { event.preventDefault(); navigate(`/groups/${snapshot.group_id}`); }}
+      >
+        ← Back to group
+      </a>
 
-      <section className="card">
+      <section className="page-intro">
         <div className="row poll-heading">
-          <span className="badge">{open ? 'Open' : 'Closed'}</span>
+          <span className={`chip ${open ? 'open' : ''}`}>{open ? 'Voting open' : 'Closed'}</span>
           <span className={`live-status ${status}`} role="status">{statusLabels[status]}</span>
         </div>
-        <h2>{snapshot.question}</h2>
-        <p className="muted">{open ? 'Suggest a restaurant, then choose your favorite.' : 'Voting has ended.'}</p>
+        <h2 className="display">{snapshot.question}</h2>
+        <p className="muted">{open ? 'Suggest a restaurant, then vote for the one you want.' : 'Voting has ended.'}</p>
+      </section>
 
-        {error && (
-          <p className="error" role="alert">
-            {error}{' '}
-            <button type="button" className="link" onClick={() => watcher.current?.refresh()}>Retry</button>
-          </p>
-        )}
-        {actionError && <p className="error" role="alert">{actionError}</p>}
+      <section className="table">
 
         {!open && (
           <div className="notice">
             <h3>Final result</h3>
-            <p>{winner ? winner.restaurant_name : 'No restaurant was selected.'}</p>
+            <p className="display winner">{winner ? winner.restaurant_name : 'No restaurant was selected.'}</p>
           </div>
         )}
 
-        <p aria-live="polite">
-          {plural(total, 'vote')} cast{snapshot.my_option_id ? ' · You’ve voted' : ''}
-        </p>
-        {snapshot.options.length === 0 && <p className="muted">No restaurants suggested yet.</p>}
+        <div className="tally-head">
+          <p aria-live="polite">
+            {plural(total, 'vote')} cast{snapshot.my_option_id ? ' · You’ve voted' : ''}
+          </p>
+        </div>
 
-        <ul className="list options">
+        {error && (
+          <p className="error pad" role="alert">
+            {error}{' '}
+            <button type="button" className="link" onClick={() => watcher.current?.refresh()}>Retry</button>
+          </p>
+        )}
+        {actionError && <p className="error pad" role="alert">{actionError}</p>}
+
+        {snapshot.options.length === 0 && (
+          <p className="empty">No restaurants yet. Add the first one below.</p>
+        )}
+
+        <ul className="options">
           {snapshot.options.map((option) => {
             const mine = snapshot.my_option_id === option.id;
+            const leading = !open && option.id === snapshot.saved_outcome_option_id;
+            const share = total ? option.vote_count / total : 0;
             return (
-              <li key={option.id}>
+              <li
+                key={option.id}
+                className={`option${mine ? ' mine' : ''}${leading ? ' winner' : ''}`}
+                style={{ '--share': share }}
+              >
+                <span className="bar" aria-hidden="true" />
                 <div className="option-content">
-                  <h3>
-                    {option.restaurant_name}
-                    {mine && <span className="badge">Your vote</span>}
-                  </h3>
-                  <p className="muted">
-                    {[option.food_category, option.price_range].filter(Boolean).join(' · ') || 'No extra details'}
+                  <h3>{option.restaurant_name}</h3>
+                  <p className="tags">
+                    {option.food_category && <span className="tag">{option.food_category}</span>}
+                    {option.price_range && <span className="tag">{option.price_range}</span>}
+                    {mine && <span className="tag yours">Your vote</span>}
                   </p>
-                  <meter
-                    min="0"
-                    max={total || 1}
-                    value={option.vote_count}
-                    aria-label={`Vote share for ${option.restaurant_name}`}
-                  />
                 </div>
-                <div className="stack option-actions">
-                  <strong>{plural(option.vote_count, 'vote')}</strong>
+                <div className="option-actions">
+                  <strong className="count">{plural(option.vote_count, 'vote')}</strong>
                   {open && (
                     <button
                       type="button"
-                      className="secondary"
+                      className={mine ? 'selected' : 'secondary'}
                       disabled={busy || mine || offline}
                       aria-label={`Vote for ${option.restaurant_name}`}
                       onClick={() => act(() => repository.vote(pollId, option.id))}
@@ -254,7 +286,7 @@ export function PollPage({ pollId, userId, repository = defaultRepository }) {
 
       {open && (
         <div className="columns">
-          <section className="card">
+          <section className="panel">
             <h3>Suggest a restaurant</h3>
             <form onSubmit={suggest}>
               <fieldset className="stack" disabled={busy || offline}>
@@ -279,9 +311,9 @@ export function PollPage({ pollId, userId, repository = defaultRepository }) {
           </section>
 
           {snapshot.created_by === userId && (
-            <section className="card">
+            <section className="panel">
               <h3>Close poll</h3>
-              <p>End voting and save the final result.</p>
+              <p className="muted small">End voting and save the winner. Nobody can vote after this.</p>
               {confirmingClose ? (
                 <>
                   <p>Ready to close this poll?</p>

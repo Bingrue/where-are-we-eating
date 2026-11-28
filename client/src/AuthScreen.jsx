@@ -101,8 +101,11 @@ export function AuthScreen({ invitePending }) {
   const title = { 'sign-in': 'Sign in', 'sign-up': 'Create an account', reset: 'Reset your password' }[mode];
 
   return (
-    <section className="card narrow">
-      <h2>{title}</h2>
+    <section className="table pad narrow">
+      <h2 className="display">{title}</h2>
+      {mode === 'sign-in' && !invitePending && (
+        <p className="muted">Start a poll, add restaurants, and let the group vote.</p>
+      )}
       {invitePending && <p className="notice">Sign in or create an account to join the group you were invited to.</p>}
 
       <form onSubmit={submit} className="stack">
@@ -178,8 +181,8 @@ export function NewPasswordScreen({ onDone }) {
   }
 
   return (
-    <section className="card narrow">
-      <h2>Choose a new password</h2>
+    <section className="table pad narrow">
+      <h2 className="display">Choose a new password</h2>
       <form onSubmit={submit} className="stack">
         <label>
           New password

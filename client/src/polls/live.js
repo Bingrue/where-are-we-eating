@@ -12,7 +12,7 @@
 export function watchPoll({
   repository, pollId, userId, onData, onError, onStatus,
   events = globalThis.window, visibility = globalThis.document,
-  fallbackMs = 5000, reconcileMs = 30000,
+  fallbackMs = 5000, reconcileMs = 10000,
 }) {
   let stopped = false;
   let running = null;

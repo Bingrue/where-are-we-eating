@@ -74,12 +74,16 @@ function Header({ session }) {
   }, [session?.user.id]);
 
   return (
-    <header>
-      <h1><a href="/" onClick={(event) => { event.preventDefault(); navigate('/'); }}>Where Are We Eating?</a></h1>
+    <header className="site-header">
+      <h1 className="wordmark">
+        <a href="/" onClick={(event) => { event.preventDefault(); navigate('/'); }}>
+          Where are we eating<span className="mark">?</span>
+        </a>
+      </h1>
       {session && (
-        <div className="row">
-          <span className="muted">{profile?.display_name || profile?.username || session.user.email}</span>
-          <button type="button" className="secondary" onClick={() => supabase.auth.signOut()}>Sign out</button>
+        <div className="row account">
+          <span className="muted small">{profile?.display_name || profile?.username || session.user.email}</span>
+          <button type="button" className="link" onClick={() => supabase.auth.signOut()}>Sign out</button>
         </div>
       )}
     </header>
@@ -94,7 +98,7 @@ function App() {
   let content;
   if (!isSupabaseConfigured) {
     content = (
-      <section className="card">
+      <section className="table pad">
         <p>Add <code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_PUBLISHABLE_KEY</code> to <code>client/.env</code>, then restart <code>npm run dev</code>.</p>
       </section>
     );

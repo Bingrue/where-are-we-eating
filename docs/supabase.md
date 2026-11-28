@@ -99,7 +99,7 @@ In the browser, `repository.observe(pollId, ...)` opens a channel and subscribes
 
 - It shows "Live updates" only after the server confirms the subscription.
 - Every event triggers a re-read of the whole poll rather than patching the screen from the event.
-- It re-reads when the connection comes back, when the tab becomes visible, every 5 seconds while not live, and every 30 seconds regardless.
+- It re-reads when the connection comes back, when the tab becomes visible, every 5 seconds while not live, and every 10 seconds regardless (so a missed Realtime event shows up within 10 seconds).
 
 ## Migrations
 
